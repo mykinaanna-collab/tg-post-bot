@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -22,7 +23,9 @@ from aiogram.fsm.state import StatesGroup, State
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 OWNER_ID = int((os.getenv("OWNER_ID", "0") or "0").strip())
 
-CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()  # лучше @username канала
+# Для канала советую @username (надежнее), но можно и -100...
+CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
+
 TIMEZONE = (os.getenv("TIMEZONE") or "Europe/Moscow").strip()
 TZ = ZoneInfo(TIMEZONE)
 
@@ -34,6 +37,7 @@ ENV_ADMINS = set(
 # Файлы хранения
 JOBS_FILE = "jobs.json"
 ADMINS_FILE = "admins.json"
+POSTS_FILE = "posts.json"
 
 
 # ================== HELPERS ==================
@@ -48,7 +52,6 @@ def parse_buttons(text: str):
         if not line:
             continue
 
-        # самые частые разделители
         seps = [" - ", " — ", " – ", " | "]
         sep_found = None
         for sep in seps:
@@ -71,6 +74,8 @@ def parse_buttons(text: str):
 
 
 def build_kb(buttons):
+    if not buttons:
+        return None
     rows = []
     for title, url in buttons:
         rows.append([InlineKeyboardButton(text=title, url=url)])
@@ -119,7 +124,7 @@ def load_admins() -> set[int]:
 def save_admins(admins: set[int]) -> None:
     admins = set(admins)
     if OWNER_ID:
-        admins.add(OWNER_ID)  # OWNER нельзя потерять
+        admins.add(OWNER_ID)
     with open(ADMINS_FILE, "w", encoding="utf-8") as f:
         json.dump(sorted(list(admins)), f, ensure_ascii=False, indent=2)
 
@@ -162,12 +167,74 @@ def save_jobs(jobs: list[Job]) -> None:
 JOBS: list[Job] = load_jobs()
 
 
+# ================== POSTS STORAGE (published by bot) ==================
+@dataclass
+class PublishedPost:
+    id: str
+    channel_id: str
+    message_id: int
+    text: str
+    buttons: list
+    created_by: int
+    created_at_iso: str
+
+
+def load_posts() -> list[PublishedPost]:
+    if not os.path.exists(POSTS_FILE):
+        return []
+    try:
+        with open(POSTS_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return [PublishedPost(**item) for item in raw]
+    except Exception:
+        return []
+
+
+def save_posts(posts: list[PublishedPost]) -> None:
+    with open(POSTS_FILE, "w", encoding="utf-8") as f:
+        json.dump([asdict(p) for p in posts], f, ensure_ascii=False, indent=2)
+
+
+POSTS: list[PublishedPost] = load_posts()
+
+
+def find_post(post_id: str) -> Optional[PublishedPost]:
+    for p in POSTS:
+        if p.id == post_id:
+            return p
+    return None
+
+
+def post_controls_kb(post_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{post_id}"),
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"del:{post_id}"),
+        ]
+    ])
+
+
+def delete_confirm_kb(post_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"del_yes:{post_id}"),
+            InlineKeyboardButton(text="❌ Нет", callback_data=f"del_no:{post_id}"),
+        ]
+    ])
+
+
 # ================== FSM ==================
-class Post(StatesGroup):
+class CreatePost(StatesGroup):
     text = State()
     buttons = State()
     preview = State()
     schedule_dt = State()
+
+
+class EditPost(StatesGroup):
+    text = State()
+    buttons = State()
+    preview = State()
 
 
 # ================== BOT ==================
@@ -178,17 +245,20 @@ dp = Dispatcher()
 async def start(m: Message):
     await m.answer(
         "Привет! Я бот для публикации постов в канал с кнопками.\n\n"
-        "Команды:\n"
+        "Команды (для админов):\n"
         "/newpost — создать пост\n"
-        "/myid — узнать свой user_id\n"
-        "/jobs — список запланированных (для админов)\n"
-        "/deljob ID — удалить запланированный (для админов)\n\n"
+        "/posts — последние опубликованные ботом (для редактирования/удаления)\n"
+        "/jobs — запланированные\n"
+        "/deljob ID — удалить запланированный\n\n"
+        "Команды (для всех):\n"
+        "/myid — узнать свой user_id\n\n"
         "Админы (только для владельца):\n"
         "/admins — список\n"
         "/addadmin 123 — добавить по id\n"
-        "/addadmin (в ответ на пересланное сообщение) — добавить по пересланному\n"
+        "/addadmin (ответом на пересланное сообщение) — добавить по сообщению\n"
         "/deladmin 123 — удалить\n\n"
-        f"Таймзона: {TIMEZONE}"
+        f"Таймзона: {TIMEZONE}\n"
+        f"Канал: {CHANNEL_ID!r}"
     )
 
 
@@ -218,7 +288,6 @@ async def cmd_addadmin(m: Message):
     if m.from_user.id != OWNER_ID:
         return await m.answer("Нет доступа.")
 
-    # Вариант 1: /addadmin 123456789
     parts = (m.text or "").split()
     if len(parts) == 2 and parts[1].isdigit():
         uid = int(parts[1])
@@ -226,15 +295,12 @@ async def cmd_addadmin(m: Message):
         save_admins(ADMIN_IDS)
         return await m.answer(f"✅ Добавила админа: {uid}")
 
-    # Вариант 2: /addadmin как reply на пересланное сообщение
-    # (или reply на любое сообщение человека)
     if m.reply_to_message and m.reply_to_message.from_user:
         uid = m.reply_to_message.from_user.id
         ADMIN_IDS.add(uid)
         save_admins(ADMIN_IDS)
         return await m.answer(f"✅ Добавила админа по сообщению: {uid}")
 
-    # Если не получилось
     await m.answer(
         "Как добавить админа:\n"
         "1) /addadmin 123456789\n"
@@ -261,7 +327,7 @@ async def cmd_deladmin(m: Message):
         await m.answer("Такого админа нет.")
 
 
-# --------- POST FLOW ---------
+# --------- CREATE POST FLOW ---------
 @dp.message(Command("cancel"))
 async def cancel(m: Message, state: FSMContext):
     await state.clear()
@@ -272,17 +338,18 @@ async def cancel(m: Message, state: FSMContext):
 async def newpost(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return await m.answer("Нет доступа.")
-    await state.set_state(Post.text)
+    await state.clear()
+    await state.set_state(CreatePost.text)
     await m.answer("Пришли текст поста.")
 
 
-@dp.message(Post.text)
+@dp.message(CreatePost.text)
 async def get_text(m: Message, state: FSMContext):
     text = (m.text or "").strip()
     if not text:
         return await m.answer("Нужен текст поста.")
     await state.update_data(text=text)
-    await state.set_state(Post.buttons)
+    await state.set_state(CreatePost.buttons)
     await m.answer(
         "Теперь кнопки (по одной строке):\n"
         "Текст - https://example.com\n\n"
@@ -291,7 +358,7 @@ async def get_text(m: Message, state: FSMContext):
     )
 
 
-@dp.message(Post.buttons)
+@dp.message(CreatePost.buttons)
 async def get_buttons(m: Message, state: FSMContext):
     data = await state.get_data()
     text = data["text"]
@@ -303,7 +370,7 @@ async def get_buttons(m: Message, state: FSMContext):
         buttons = parse_buttons(raw)
 
     await state.update_data(buttons=buttons)
-    await state.set_state(Post.preview)
+    await state.set_state(CreatePost.preview)
 
     kb = build_kb(buttons)
     await m.answer("🧾 Предпросмотр поста:")
@@ -318,6 +385,24 @@ async def cb_cancel(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
+async def _publish(bot: Bot, channel_id: str, text: str, buttons: list, created_by: int) -> PublishedPost:
+    kb = build_kb(buttons)
+    msg = await bot.send_message(channel_id, text, reply_markup=kb)
+    post_id = f"{int(datetime.now(TZ).timestamp())}_{created_by}_{msg.message_id}"
+    p = PublishedPost(
+        id=post_id,
+        channel_id=channel_id,
+        message_id=msg.message_id,
+        text=text,
+        buttons=buttons,
+        created_by=created_by,
+        created_at_iso=datetime.now(TZ).isoformat(),
+    )
+    POSTS.append(p)
+    save_posts(POSTS)
+    return p
+
+
 @dp.callback_query(F.data == "pub_now")
 async def cb_pub_now(c: CallbackQuery, state: FSMContext, bot: Bot):
     if not is_admin(c.from_user.id):
@@ -330,17 +415,21 @@ async def cb_pub_now(c: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     text = data.get("text", "")
     buttons = data.get("buttons", [])
-    kb = build_kb(buttons)
 
     try:
-        await bot.send_message(CHANNEL_ID, text, reply_markup=kb)
+        p = await _publish(bot, CHANNEL_ID, text, buttons, c.from_user.id)
     except Exception as e:
         await c.answer("Не смог опубликовать. Проверь права бота в канале.", show_alert=True)
         await c.message.answer(f"Ошибка: {e}")
         return
 
     await state.clear()
-    await c.message.edit_text(f"✅ Опубликовано! Куда: {CHANNEL_ID!r}")
+    await c.message.edit_text("✅ Опубликовано!")
+    await c.message.answer(
+        f"Управление постом (id: `{p.id}`):",
+        parse_mode="Markdown",
+        reply_markup=post_controls_kb(p.id),
+    )
     await c.answer()
 
 
@@ -350,7 +439,7 @@ async def cb_schedule(c: CallbackQuery, state: FSMContext):
         await c.answer("Нет доступа.", show_alert=True)
         return
 
-    await state.set_state(Post.schedule_dt)
+    await state.set_state(CreatePost.schedule_dt)
     now = datetime.now(TZ)
     await c.message.answer(
         "Ок, запланируем.\n"
@@ -363,7 +452,7 @@ async def cb_schedule(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-@dp.message(Post.schedule_dt)
+@dp.message(CreatePost.schedule_dt)
 async def set_schedule_dt(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return await m.answer("Нет доступа.")
@@ -400,6 +489,7 @@ async def set_schedule_dt(m: Message, state: FSMContext):
     await m.answer(f"✅ Запланировано на {run_at.strftime('%d.%m.%Y %H:%M')} ({TIMEZONE})")
 
 
+# --------- JOBS (scheduled) ---------
 @dp.message(Command("jobs"))
 async def list_jobs(m: Message):
     if not is_admin(m.from_user.id):
@@ -430,6 +520,204 @@ async def del_job(m: Message):
     await m.answer("✅ Удалила задачу.")
 
 
+# --------- POSTS LIST / EDIT / DELETE ---------
+@dp.message(Command("posts"))
+async def list_posts(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    if not POSTS:
+        return await m.answer("Пока нет постов, опубликованных ботом.")
+    # показываем последние 10
+    recent = sorted(POSTS, key=lambda p: p.created_at_iso)[-10:]
+    lines = ["🧾 Последние посты (ботом):"]
+    for p in reversed(recent):
+        dt = datetime.fromisoformat(p.created_at_iso).astimezone(TZ)
+        lines.append(f"- {dt.strftime('%d.%m.%Y %H:%M')} — id: `{p.id}` (msg_id: {p.message_id})")
+    lines.append("\nРедактировать: нажми ✏️ под постом или /editpost ID")
+    lines.append("Удалить: 🗑 под постом или /delpost ID")
+    await m.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("editpost"))
+async def editpost_cmd(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        return await m.answer("Использование: /editpost ID\nЛибо нажми ✏️ под сообщением управления постом.")
+    post_id = parts[1].strip()
+    p = find_post(post_id)
+    if not p:
+        return await m.answer("Не нашла такой пост (бот может редактировать только свои публикации).")
+
+    await state.clear()
+    await state.set_state(EditPost.text)
+    await state.update_data(edit_post_id=post_id)
+    await m.answer("Ок, пришли НОВЫЙ текст поста (заменит старый).")
+
+
+@dp.message(Command("delpost"))
+async def delpost_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    parts = (m.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        return await m.answer("Использование: /delpost ID\nЛибо нажми 🗑 под сообщением управления постом.")
+    post_id = parts[1].strip()
+    p = find_post(post_id)
+    if not p:
+        return await m.answer("Не нашла такой пост.")
+    await m.answer("Подтвердить удаление?", reply_markup=delete_confirm_kb(post_id))
+
+
+@dp.callback_query(F.data.startswith("edit:"))
+async def cb_edit_start(c: CallbackQuery, state: FSMContext):
+    if not is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    post_id = c.data.split(":", 1)[1]
+    p = find_post(post_id)
+    if not p:
+        await c.answer("Пост не найден.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(EditPost.text)
+    await state.update_data(edit_post_id=post_id)
+    await c.message.answer("✏️ Редактирование: пришли НОВЫЙ текст поста.")
+    await c.answer()
+
+
+@dp.message(EditPost.text)
+async def edit_get_text(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    text = (m.text or "").strip()
+    if not text:
+        return await m.answer("Нужен текст.")
+    await state.update_data(new_text=text)
+    await state.set_state(EditPost.buttons)
+    await m.answer(
+        "Теперь НОВЫЕ кнопки (по одной строке):\n"
+        "Текст - https://example.com\n\n"
+        "Если кнопки не нужны — напиши `нет`",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(EditPost.buttons)
+async def edit_get_buttons(m: Message, state: FSMContext):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    raw = (m.text or "").strip()
+    if raw.lower() == "нет":
+        buttons = []
+    else:
+        buttons = parse_buttons(raw)
+
+    data = await state.get_data()
+    post_id = data.get("edit_post_id")
+    new_text = data.get("new_text", "")
+
+    await state.update_data(new_buttons=buttons)
+    await state.set_state(EditPost.preview)
+
+    kb = build_kb(buttons)
+    await m.answer("🧾 Предпросмотр обновлённого поста:")
+    await m.answer(new_text, reply_markup=kb)
+
+    # отдельные кнопки подтверждения
+    kb2 = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Применить изменения", callback_data=f"apply_edit:{post_id}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel")],
+    ])
+    await m.answer("Применить изменения?", reply_markup=kb2)
+
+
+@dp.callback_query(F.data.startswith("apply_edit:"))
+async def cb_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
+    if not is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    post_id = c.data.split(":", 1)[1]
+    p = find_post(post_id)
+    if not p:
+        await c.answer("Пост не найден.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    new_text = data.get("new_text", "")
+    new_buttons = data.get("new_buttons", [])
+
+    try:
+        await bot.edit_message_text(
+            chat_id=p.channel_id,
+            message_id=p.message_id,
+            text=new_text,
+            reply_markup=build_kb(new_buttons),
+        )
+    except Exception as e:
+        await c.answer("Не смогла отредактировать. Проверь права бота.", show_alert=True)
+        await c.message.answer(f"Ошибка: {e}")
+        return
+
+    # обновим запись
+    p.text = new_text
+    p.buttons = new_buttons
+    save_posts(POSTS)
+
+    await state.clear()
+    await c.message.answer("✅ Обновила пост в канале.")
+    await c.message.answer(f"Управление постом (id: `{p.id}`):", parse_mode="Markdown", reply_markup=post_controls_kb(p.id))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("del:"))
+async def cb_del_ask(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    post_id = c.data.split(":", 1)[1]
+    p = find_post(post_id)
+    if not p:
+        await c.answer("Пост не найден.", show_alert=True)
+        return
+    await c.message.answer("Подтвердить удаление?", reply_markup=delete_confirm_kb(post_id))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("del_no:"))
+async def cb_del_no(c: CallbackQuery):
+    await c.message.edit_text("Ок, не удаляю.")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("del_yes:"))
+async def cb_del_yes(c: CallbackQuery, bot: Bot):
+    if not is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    post_id = c.data.split(":", 1)[1]
+    p = find_post(post_id)
+    if not p:
+        await c.answer("Пост не найден.", show_alert=True)
+        return
+
+    try:
+        await bot.delete_message(chat_id=p.channel_id, message_id=p.message_id)
+    except Exception as e:
+        await c.answer("Не смогла удалить. Проверь права бота.", show_alert=True)
+        await c.message.answer(f"Ошибка: {e}")
+        return
+
+    # убрать из списка
+    POSTS[:] = [x for x in POSTS if x.id != post_id]
+    save_posts(POSTS)
+
+    await c.message.edit_text("✅ Удалила пост из канала.")
+    await c.answer()
+
+
 # ================== SCHEDULER ==================
 async def scheduler_loop(bot: Bot):
     while True:
@@ -444,8 +732,9 @@ async def scheduler_loop(bot: Bot):
             if due:
                 for j in due:
                     try:
-                        kb = build_kb(j.buttons)
-                        await bot.send_message(j.channel_id, j.text, reply_markup=kb)
+                        p = await _publish(bot, j.channel_id, j.text, j.buttons, j.created_by)
+                        # можно логнуть в чат админа, но пока не будем
+                        _ = p
                     except Exception:
                         # если не отправилось — оставляем, чтобы не потерять
                         continue
@@ -483,7 +772,7 @@ async def main():
 
     bot = Bot(BOT_TOKEN)
 
-    # На всякий: если когда-то включали webhook
+    # на всякий случай, если когда-то включали webhook
     await bot.delete_webhook(drop_pending_updates=True)
 
     # Render требует открытый порт
@@ -497,3 +786,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
