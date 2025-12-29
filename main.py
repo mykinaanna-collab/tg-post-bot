@@ -308,7 +308,7 @@ class CreatePost(StatesGroup):
     text = State()
     buttons = State()
     preview = State()
-    schedule_manual = State()  # ручной ввод даты
+    schedule_manual = State()
 
 class EditPost(StatesGroup):
     text = State()
@@ -329,8 +329,7 @@ async def start(m: Message):
     uid = m.from_user.id
     if is_admin(uid):
         await m.answer(
-            "Привет! Меню доступно админам.\n"
-            "Нажми кнопки ниже 👇",
+            "Привет! Меню доступно админам.\nНажми кнопки ниже 👇",
             reply_markup=admin_menu_kb(is_owner(uid))
         )
     else:
@@ -410,6 +409,7 @@ async def cmd_addadmin(m: Message):
     if not is_owner(m.from_user.id):
         return await m.answer("Нет доступа.")
 
+    # Вариант 1: /addadmin 123456789
     parts = (m.text or "").split()
     if len(parts) == 2 and parts[1].isdigit():
         uid = int(parts[1])
@@ -417,17 +417,41 @@ async def cmd_addadmin(m: Message):
         save_admins(ADMIN_IDS)
         return await m.answer(f"✅ Добавила админа: {uid}")
 
-    if m.reply_to_message and m.reply_to_message.from_user:
-        uid = m.reply_to_message.from_user.id
-        ADMIN_IDS.add(uid)
-        save_admins(ADMIN_IDS)
-        return await m.answer(f"✅ Добавила админа по сообщению: {uid}")
+    # Вариант 2: /addadmin как reply на пересланное сообщение
+    if m.reply_to_message:
+        # ВАЖНО: при пересылке from_user = ты, а настоящий автор в forward_from (если не скрыт)
+        if m.reply_to_message.forward_from:
+            uid = m.reply_to_message.forward_from.id
+            ADMIN_IDS.add(uid)
+            save_admins(ADMIN_IDS)
+            return await m.answer(f"✅ Добавила админа по пересланному сообщению: {uid}")
+
+        # Если forward_from пуст — у человека включена privacy пересылки
+        # Тогда безопасно добавлять по from_user нельзя (это будет твой id)
+        if m.reply_to_message.from_user and m.reply_to_message.from_user.id == m.from_user.id:
+            return await m.answer(
+                "Не могу определить сотрудника по пересылке — Telegram скрывает автора (privacy).\n\n"
+                "Варианты:\n"
+                "1) Пусть сотрудник напишет боту /myid и пришлёт тебе цифры → /addadmin 123\n"
+                "2) Или сотрудник может временно разрешить показывать автора при пересылке."
+            )
+
+        # Если это не пересылка, а ты ответила на сообщение другого человека (теоретически),
+        # тогда можно взять from_user
+        if m.reply_to_message.from_user:
+            uid = m.reply_to_message.from_user.id
+            if uid == m.from_user.id:
+                return await m.answer("Похоже, это твоё сообщение 🙂 Пришли /addadmin 123 или ответь на сообщение сотрудника.")
+            ADMIN_IDS.add(uid)
+            save_admins(ADMIN_IDS)
+            return await m.answer(f"✅ Добавила админа по сообщению: {uid}")
 
     await m.answer(
         "Как добавить админа:\n"
         "1) /addadmin 123456789\n"
         "или\n"
-        "2) Перешли сообщение сотрудника → ответь на него командой /addadmin"
+        "2) Перешли сообщение сотрудника → ответь на него командой /addadmin\n\n"
+        "Если Telegram скрывает автора пересылки — попроси у сотрудника /myid."
     )
 
 @dp.message(Command("deladmin"))
@@ -553,11 +577,7 @@ async def cb_schedule_start(c: CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         await c.answer("Нет доступа.", show_alert=True)
         return
-    # entity_id = draft (один черновик в FSM)
-    await c.message.answer(
-        "Выбери время публикации (МСК):",
-        reply_markup=quick_times_kb("draft_time", "draft")
-    )
+    await c.message.answer("Выбери время публикации (МСК):", reply_markup=quick_times_kb("draft_time", "draft"))
     await c.answer()
 
 @dp.callback_query(F.data.startswith("draft_time:draft:"))
@@ -608,7 +628,7 @@ async def finalize_schedule(target: Message, state: FSMContext):
     if run_at <= now_tz() + timedelta(seconds=30):
         return await target.answer("Время должно быть хотя бы на 1 минуту позже текущего.")
 
-    job_id = f"{int(now_tz().timestamp())}_{(data.get('created_by') or 'x')}_{target.from_user.id}"
+    job_id = f"{int(now_tz().timestamp())}_{target.from_user.id}"
     job = Job(
         id=job_id,
         channel_id=CHANNEL_ID,
@@ -942,7 +962,6 @@ async def scheduler_loop(bot: Bot):
                     try:
                         _ = await publish(bot, j.channel_id, j.text, j.buttons, j.created_by)
                     except Exception:
-                        # не отправилось — оставляем (чтобы не потерять)
                         continue
                     JOBS.remove(j)
                 save_jobs(JOBS)
@@ -975,18 +994,13 @@ async def main():
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render → Environment.")
 
     bot = Bot(BOT_TOKEN)
-
-    # если когда-то включали webhook — уберём
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # Render требует открытый порт
     await run_web_server()
-
-    # Планировщик отложенных постов
     asyncio.create_task(scheduler_loop(bot))
-
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
