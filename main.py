@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -17,25 +18,21 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 
 
-# ===== НАСТРОЙКИ (Render → Environment) =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+# ===== НАСТРОЙКИ (Render → Environment Variables) =====
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int((os.getenv("OWNER_ID", "0") or "0").strip())
 
-# Канал: лучше chat_id вида -100...
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_ID = (os.getenv("CHANNEL_ID") or "").strip()
 
-# Админы (user_id через запятую): "111,222"
 ADMIN_IDS = set(
-    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+    int(x) for x in (os.getenv("ADMIN_IDS", "") or "").split(",") if x.strip().isdigit()
 )
 if OWNER_ID:
     ADMIN_IDS.add(OWNER_ID)
 
-# Таймзона (можно не трогать). По умолчанию +07:00
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Bangkok")
+TIMEZONE = (os.getenv("TIMEZONE") or "Europe/Moscow").strip()
 TZ = ZoneInfo(TIMEZONE)
 
-# Файл для запланированных постов
 JOBS_FILE = "jobs.json"
 
 
@@ -45,23 +42,35 @@ def is_admin(user_id: int) -> bool:
 
 def parse_buttons(text: str):
     """
-    Формат строк:
+    Формат:
     Текст - https://example.com
+    (допускаем разные тире/разделители)
     """
     buttons = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
-        # допускаем разные тире
-        for sep in [" - ", " — ", " – ", "-"]:
+
+        # Пытаемся распарсить по самым частым разделителям
+        seps = [" - ", " — ", " – ", " | "]
+        found = None
+        for sep in seps:
             if sep in line:
-                left, right = line.split(sep, 1)
-                title = left.strip()
-                url = right.strip()
-                if title and url.startswith(("http://", "https://")):
-                    buttons.append((title[:64], url))
+                found = sep
                 break
+
+        if found:
+            title, url = line.split(found, 1)
+        elif "-" in line:
+            title, url = line.split("-", 1)
+        else:
+            continue
+
+        title = title.strip()
+        url = url.strip()
+        if title and url.startswith(("http://", "https://")):
+            buttons.append((title[:64], url))
     return buttons
 
 def build_kb(buttons):
@@ -79,11 +88,10 @@ def preview_actions_kb():
 
 def parse_dt_local(s: str) -> datetime:
     """
-    Ожидаем формат: DD.MM.YYYY HH:MM
+    Формат: DD.MM.YYYY HH:MM
     Пример: 29.12.2025 18:30
     """
-    s = s.strip()
-    dt = datetime.strptime(s, "%d.%m.%Y %H:%M")
+    dt = datetime.strptime(s.strip(), "%d.%m.%Y %H:%M")
     return dt.replace(tzinfo=TZ)
 
 
@@ -94,7 +102,7 @@ class Job:
     channel_id: str
     text: str
     buttons: list
-    run_at_iso: str  # ISO datetime with tz
+    run_at_iso: str
     created_by: int
 
 def load_jobs() -> list[Job]:
@@ -114,7 +122,7 @@ def save_jobs(jobs: list[Job]) -> None:
 JOBS: list[Job] = load_jobs()
 
 
-# ===== СОСТОЯНИЯ =====
+# ===== FSM =====
 class Post(StatesGroup):
     text = State()
     buttons = State()
@@ -122,7 +130,7 @@ class Post(StatesGroup):
     schedule_dt = State()
 
 
-# ===== БОТ =====
+# ===== BOT =====
 dp = Dispatcher()
 
 @dp.message(Command("start"))
@@ -132,15 +140,26 @@ async def start(m: Message):
         "Команды:\n"
         "/newpost — создать пост\n"
         "/myid — узнать свой user_id\n"
-        "/cancel — отменить текущий шаг\n"
-        "/jobs — список запланированных (для админов)\n\n"
-        "Формат кнопок:\n"
-        "Текст - https://ссылка"
+        "/jobs — список запланированных\n"
+        "/deljob ID — удалить запланированный\n"
+        "/cancel — отменить\n\n"
+        "Кнопки:\n"
+        "Текст - https://ссылка\n\n"
+        f"Таймзона сейчас: {TIMEZONE}"
     )
 
 @dp.message(Command("myid"))
 async def myid(m: Message):
-    await m.answer(f"Твой user_id: {m.from_user.id}")
+    uid = m.from_user.id
+    await m.answer(
+        "Диагностика:\n"
+        f"- твой user_id: {uid}\n"
+        f"- OWNER_ID (Render): {OWNER_ID}\n"
+        f"- ты админ по мнению бота: {uid in ADMIN_IDS}\n"
+        f"- ADMIN_IDS (Render): {sorted(list(ADMIN_IDS))}\n"
+        f"- TIMEZONE: {TIMEZONE}\n"
+        f"- CHANNEL_ID задан: {'да' if CHANNEL_ID else 'нет'}"
+    )
 
 @dp.message(Command("cancel"))
 async def cancel(m: Message, state: FSMContext):
@@ -152,7 +171,7 @@ async def newpost(m: Message, state: FSMContext):
     if not is_admin(m.from_user.id):
         return await m.answer("Нет доступа.")
     await state.set_state(Post.text)
-    await m.answer("Пришли текст поста (обычное сообщение).")
+    await m.answer("Пришли текст поста.")
 
 @dp.message(Post.text)
 async def get_text(m: Message, state: FSMContext):
@@ -164,7 +183,8 @@ async def get_text(m: Message, state: FSMContext):
     await m.answer(
         "Теперь кнопки (по одной строке):\n"
         "Текст - https://example.com\n\n"
-        "Если кнопки не нужны — напиши `нет`"
+        "Если кнопки не нужны — напиши `нет`",
+        parse_mode="Markdown"
     )
 
 @dp.message(Post.buttons)
@@ -222,13 +242,15 @@ async def cb_schedule(c: CallbackQuery, state: FSMContext):
     if not is_admin(c.from_user.id):
         await c.answer("Нет доступа.", show_alert=True)
         return
+
     await state.set_state(Post.schedule_dt)
     now = datetime.now(TZ)
     await c.message.answer(
         "Ок, запланируем.\n"
         "Введи дату и время в формате:\n"
         "`DD.MM.YYYY HH:MM`\n"
-        f"Например: `{now.strftime('%d.%m.%Y %H:%M')}`",
+        f"Например: `{now.strftime('%d.%m.%Y %H:%M')}`\n\n"
+        f"Таймзона: *{TIMEZONE}*",
         parse_mode="Markdown"
     )
     await c.answer()
@@ -279,7 +301,7 @@ async def list_jobs(m: Message):
     for j in sorted(JOBS, key=lambda x: x.run_at_iso):
         dt = datetime.fromisoformat(j.run_at_iso)
         lines.append(f"- {dt.strftime('%d.%m.%Y %H:%M')} — id: `{j.id}`")
-    lines.append("\nЧтобы удалить: /deljob ID")
+    lines.append("\nУдалить: /deljob ID")
     await m.answer("\n".join(lines), parse_mode="Markdown")
 
 @dp.message(Command("deljob"))
@@ -315,27 +337,50 @@ async def scheduler_loop(bot: Bot):
                         kb = build_kb(j.buttons)
                         await bot.send_message(j.channel_id, j.text, reply_markup=kb)
                     except Exception:
-                        # если не отправилось — оставим, чтобы не потерять
+                        # если не отправилось — оставляем (не теряем)
                         continue
-                    # если отправилось — удаляем
+
                     JOBS.remove(j)
+
                 save_jobs(JOBS)
 
         except Exception:
             pass
 
-        await asyncio.sleep(20)  # проверка каждые 20 секунд
+        await asyncio.sleep(20)
+
+
+# ===== WEB SERVER (чтобы Render видел порт) =====
+async def run_web_server():
+    app = web.Application()
+
+    async def health(_):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
 
 
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render → Environment.")
+
     bot = Bot(BOT_TOKEN)
 
-    # Запускаем планировщик
+    # Важно для Render Web Service:
+    await run_web_server()
+
+    # Планировщик отложенных постов:
     asyncio.create_task(scheduler_loop(bot))
 
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
