@@ -186,8 +186,16 @@ async def init_db():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty. Set it in Render → Environment.")
 
-    ssl = "require" if _need_ssl_from_url(DATABASE_URL) else None
-    POOL = await asyncpg.create_pool(DATABASE_URL, ssl=ssl, min_size=1, max_size=5)
+ssl = True if _need_ssl_from_url(DATABASE_URL) else None
+POOL = await asyncpg.create_pool(
+    DATABASE_URL,
+    ssl=ssl,
+    min_size=1,
+    max_size=5,
+    timeout=10,            # важно: чтобы не “висеть”
+    command_timeout=30     # на всякий случай
+)
+
 
     async with POOL.acquire() as conn:
         await conn.execute("""
