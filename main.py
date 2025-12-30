@@ -181,32 +181,35 @@ POOL: asyncpg.Pool | None = None
 def _need_ssl_from_url(url: str) -> bool:
     return "sslmode=require" in url.lower()
 
-async def init_db():
+async def init_db() -> None:
     global POOL
+
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty. Set it in Render → Environment.")
 
-ssl = True if _need_ssl_from_url(DATABASE_URL) else None
-POOL = await asyncpg.create_pool(
-    DATABASE_URL,
-    ssl=ssl,
-    min_size=1,
-    max_size=5,
-    timeout=10,            # важно: чтобы не “висеть”
-    command_timeout=30     # на всякий случай
-)
+    ssl = True if "sslmode=require" in DATABASE_URL.lower() else None
 
-async with POOL.acquire() as conn:
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            name TEXT,
-            added_at TIMESTAMPTZ DEFAULT NOW()
-        );
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
+    POOL = await asyncpg.create_pool(
+        DATABASE_URL,
+        ssl=ssl,
+        min_size=1,
+        max_size=5,
+        timeout=10,
+        command_timeout=30,
+    )
+
+    async with POOL.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                name TEXT,
+                added_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 channel_id TEXT NOT NULL,
                 text TEXT NOT NULL,
@@ -217,6 +220,7 @@ async with POOL.acquire() as conn:
                 created_at TIMESTAMPTZ DEFAULT NOW()
             );
         """)
+
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id TEXT PRIMARY KEY,
@@ -231,7 +235,6 @@ async with POOL.acquire() as conn:
             );
         """)
 
-        # OWNER always admin
         if OWNER_ID:
             await conn.execute("""
                 INSERT INTO admins (user_id, username, name)
@@ -239,15 +242,6 @@ async with POOL.acquire() as conn:
                 ON CONFLICT (user_id) DO NOTHING;
             """, OWNER_ID)
 
-        # ENV admins
-        for uid in ENV_ADMINS:
-            if uid == OWNER_ID:
-                continue
-            await conn.execute("""
-                INSERT INTO admins (user_id, username, name)
-                VALUES ($1, NULL, NULL)
-                ON CONFLICT (user_id) DO NOTHING;
-            """, uid)
 
 async def db_is_admin(user_id: int) -> bool:
     assert POOL is not None
