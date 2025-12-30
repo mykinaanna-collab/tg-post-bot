@@ -196,18 +196,17 @@ POOL = await asyncpg.create_pool(
     command_timeout=30     # на всякий случай
 )
 
-
-    async with POOL.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                name TEXT,
-                added_at TIMESTAMPTZ DEFAULT NOW()
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
+async with POOL.acquire() as conn:
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            name TEXT,
+            added_at TIMESTAMPTZ DEFAULT NOW()
+        );
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 channel_id TEXT NOT NULL,
                 text TEXT NOT NULL,
