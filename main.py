@@ -1,10 +1,9 @@
 import os
 import json
 import asyncio
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, List
+from typing import Optional
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -274,7 +273,10 @@ def job_controls_kb(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="👁 Посмотреть", callback_data=f"job:view:{job_id}"),
-            InlineKeyboardButton(text="✏️ Перенести", callback_data=f"job:move:{job_id}"),
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"job:edit:{job_id}"),
+        ],
+        [
+            InlineKeyboardButton(text="🕒 Перенести", callback_data=f"job:move:{job_id}"),
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"job:del:{job_id}"),
         ]
     ])
@@ -293,11 +295,18 @@ class CreatePost(StatesGroup):
     text = State()
     buttons = State()
     photo = State()
-    long_with_photo_choice = State()  # if caption too long
+    long_with_photo_choice = State()
     preview = State()
     schedule_manual = State()
 
 class EditPost(StatesGroup):
+    text = State()
+    buttons = State()
+    photo = State()
+    long_with_photo_choice = State()
+    preview = State()
+
+class EditJob(StatesGroup):
     text = State()
     buttons = State()
     photo = State()
@@ -375,7 +384,7 @@ async def menu_help(m: Message):
     await m.answer(
         "Что умею:\n"
         "• 📝 Новый пост (текст + кнопки + фото)\n"
-        "• 📅 Запланированные (посмотреть/перенести/удалить)\n"
+        "• 📅 Запланированные (посмотреть/редактировать/перенести/удалить)\n"
         "• 🧾 Опубликованные (редактировать/удалить)\n\n"
         "Если меню пропало — /menu",
         reply_markup=admin_menu_kb(is_owner(m.from_user.id))
@@ -411,7 +420,6 @@ async def cmd_addadmin(m: Message, bot: Bot):
 
     parts = (m.text or "").split()
 
-    # /addadmin 123
     if len(parts) == 2 and parts[1].isdigit():
         uid = int(parts[1])
         username = None
@@ -437,7 +445,6 @@ async def cmd_addadmin(m: Message, bot: Bot):
         disp = f"@{username} ({uid})" if username else (f"{name} ({uid})" if name else str(uid))
         return await m.answer(f"✅ Добавила админа: {disp}")
 
-    # reply-based addadmin
     if m.reply_to_message:
         if m.reply_to_message.forward_from:
             u = m.reply_to_message.forward_from
@@ -581,7 +588,6 @@ async def create_get_photo(m: Message, state: FSMContext):
 
     await state.update_data(photo_file_id=photo_file_id)
 
-    # If photo exists but caption too long -> ask choice
     if photo_file_id and caption_too_long(text):
         await state.set_state(CreatePost.long_with_photo_choice)
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -595,7 +601,6 @@ async def create_get_photo(m: Message, state: FSMContext):
             reply_markup=kb
         )
 
-    # normal preview
     await show_preview_create(m, state, text=text, buttons=buttons, photo_file_id=photo_file_id, split_text=False)
 
 @dp.callback_query(F.data.startswith("longphoto:"))
@@ -638,13 +643,12 @@ async def show_preview_create(m: Message, state: FSMContext, text: str, buttons:
 
     await m.answer("🧾 Предпросмотр поста:")
     if photo_file_id:
-        caption = text
         if split_text:
             caption = (text[:CAPTION_LIMIT - 3] + "…") if len(text) > CAPTION_LIMIT else text
             await m.answer_photo(photo_file_id, caption=caption, reply_markup=None)
             await m.answer(text, reply_markup=build_kb(buttons))
         else:
-            await m.answer_photo(photo_file_id, caption=caption, reply_markup=build_kb(buttons))
+            await m.answer_photo(photo_file_id, caption=text, reply_markup=build_kb(buttons))
     else:
         await m.answer(text, reply_markup=build_kb(buttons))
 
@@ -673,8 +677,7 @@ async def publish(
     """
     Returns post_id. Stores record in DB.
     If photo_file_id and split_text=True -> send photo (short caption) + send text message with buttons.
-    We store: message_id = photo message id OR text message id depending on where buttons live.
-    We choose: buttons live on text message if split_text, else on main message.
+    buttons live on the text message in split_text mode.
     """
     assert POOL is not None
 
@@ -791,7 +794,6 @@ async def finalize_schedule(target: Message, state: FSMContext):
     text = data.get("text", "")
     buttons = data.get("buttons", [])
     photo_file_id = data.get("photo_file_id")
-    split_text = bool(data.get("split_text", False))
     run_at_iso = data.get("run_at_iso")
 
     if not CHANNEL_ID:
@@ -887,6 +889,190 @@ async def cb_job_view(c: CallbackQuery):
 
     await c.answer()
 
+# ---- NEW: EDIT JOB (content) ----
+@dp.callback_query(F.data.startswith("job:edit:"))
+async def cb_job_edit_start(c: CallbackQuery, state: FSMContext):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    assert POOL is not None
+
+    job_id = c.data.split(":", 2)[2]
+    async with POOL.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
+    if not r:
+        await c.answer("Не нашла задачу.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(EditJob.text)
+    await state.update_data(edit_job_id=job_id)
+
+    await c.message.answer("✏️ Редактирование отложки: пришли НОВЫЙ текст поста.")
+    await c.answer()
+
+@dp.message(EditJob.text)
+async def editjob_get_text(m: Message, state: FSMContext):
+    if not await db_is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    text = (m.text or "").strip()
+    if not text:
+        return await m.answer("Нужен текст.")
+    await state.update_data(new_text=text)
+    await state.set_state(EditJob.buttons)
+    await m.answer(
+        "Теперь НОВЫЕ кнопки (по одной строке):\n"
+        "Текст - https://example.com\n\n"
+        "Если кнопки не нужны — напиши `нет`",
+        parse_mode="Markdown"
+    )
+
+@dp.message(EditJob.buttons)
+async def editjob_get_buttons(m: Message, state: FSMContext):
+    if not await db_is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    raw = (m.text or "").strip()
+    buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
+    await state.update_data(new_buttons=buttons)
+
+    await state.set_state(EditJob.photo)
+    await m.answer(
+        "Теперь пришли НОВОЕ фото (если хочешь заменить).\n"
+        "Если оставить старое фото — напиши `оставить`.\n"
+        "Если убрать фото — напиши `убрать`.",
+        parse_mode="Markdown"
+    )
+
+@dp.message(EditJob.photo)
+async def editjob_get_photo(m: Message, state: FSMContext):
+    if not await db_is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    assert POOL is not None
+
+    data = await state.get_data()
+    job_id = data.get("edit_job_id")
+    new_text = data.get("new_text", "")
+    new_buttons = data.get("new_buttons", [])
+
+    async with POOL.acquire() as conn:
+        r = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
+    if not r:
+        await state.clear()
+        return await m.answer("Не нашла задачу.")
+
+    incoming = (m.text or "").strip().lower()
+    photo_file_id: Optional[str] = None
+
+    if m.photo:
+        photo_file_id = m.photo[-1].file_id
+        await state.update_data(photo_file_id=photo_file_id)
+    elif m.document and (m.document.mime_type or "").startswith("image/"):
+        photo_file_id = m.document.file_id
+        await state.update_data(photo_file_id=photo_file_id)
+    elif incoming == "оставить":
+        await state.update_data(photo_file_id=r["photo_file_id"])
+    elif incoming == "убрать":
+        await state.update_data(photo_file_id=None)
+    else:
+        return await m.answer("Не вижу фото 😅 Пришли фото или напиши `оставить` / `убрать`.")
+
+    photo_file_id = (await state.get_data()).get("photo_file_id")
+
+    if photo_file_id and caption_too_long(new_text):
+        await state.set_state(EditJob.long_with_photo_choice)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📷 Короткий caption + текст отдельно", callback_data="editjoblong:split")],
+            [InlineKeyboardButton(text="📝 Без фото (весь текст одним сообщением)", callback_data="editjoblong:nophoto")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="draft:cancel")],
+        ])
+        return await m.answer(
+            f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}).\n"
+            "Как поступаем?",
+            reply_markup=kb
+        )
+
+    await show_preview_editjob(m, state, new_text, new_buttons, photo_file_id, split_text=False)
+
+@dp.callback_query(F.data.startswith("editjoblong:"))
+async def cb_editjoblong_choice(c: CallbackQuery, state: FSMContext):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+
+    data = await state.get_data()
+    new_text = data.get("new_text", "")
+    new_buttons = data.get("new_buttons", [])
+    photo_file_id = data.get("photo_file_id")
+
+    if c.data == "editjoblong:nophoto":
+        await state.update_data(photo_file_id=None, split_text=False)
+        await show_preview_editjob(c.message, state, new_text, new_buttons, None, split_text=False)
+        await c.answer()
+        return
+
+    if c.data == "editjoblong:split":
+        await state.update_data(split_text=True)
+        await show_preview_editjob(c.message, state, new_text, new_buttons, photo_file_id, split_text=True)
+        await c.answer()
+        return
+
+    await c.answer()
+
+async def show_preview_editjob(target: Message, state: FSMContext, text: str, buttons: list, photo_file_id: Optional[str], split_text: bool):
+    await state.update_data(split_text=split_text)
+    await state.set_state(EditJob.preview)
+
+    await target.answer("🧾 Предпросмотр обновлённой отложки:")
+    if photo_file_id:
+        if split_text:
+            short_caption = (text[:CAPTION_LIMIT - 3] + "…") if len(text) > CAPTION_LIMIT else text
+            await target.answer_photo(photo_file_id, caption=short_caption, reply_markup=None)
+            await target.answer(text, reply_markup=build_kb(buttons))
+        else:
+            await target.answer_photo(photo_file_id, caption=text, reply_markup=build_kb(buttons))
+    else:
+        await target.answer(text, reply_markup=build_kb(buttons))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Сохранить изменения", callback_data="job:apply_edit")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="draft:cancel")],
+    ])
+    await target.answer("Сохранить изменения в отложке?", reply_markup=kb)
+
+@dp.callback_query(F.data == "job:apply_edit")
+async def cb_job_apply_edit(c: CallbackQuery, state: FSMContext):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    assert POOL is not None
+
+    data = await state.get_data()
+    job_id = data.get("edit_job_id")
+    new_text = data.get("new_text", "")
+    new_buttons = data.get("new_buttons", [])
+    photo_file_id = data.get("photo_file_id")
+
+    buttons_json = json.dumps(new_buttons, ensure_ascii=False)
+
+    async with POOL.acquire() as conn:
+        r = await conn.fetchrow("SELECT id FROM jobs WHERE id=$1", job_id)
+    if not r:
+        await c.answer("Не нашла задачу.", show_alert=True)
+        await state.clear()
+        return
+
+    async with POOL.acquire() as conn:
+        await conn.execute("""
+            UPDATE jobs
+            SET text=$1, buttons_json=$2, photo_file_id=$3
+            WHERE id=$4
+        """, new_text, buttons_json, photo_file_id, job_id)
+
+    await state.clear()
+    await c.message.answer("✅ Обновила отложенный пост. Время публикации осталось прежним.", reply_markup=job_controls_kb(job_id))
+    await c.answer()
+
+# ---- delete job ----
 @dp.callback_query(F.data.startswith("job:del:"))
 async def cb_job_del_ask(c: CallbackQuery):
     if not await db_is_admin(c.from_user.id):
@@ -918,6 +1104,7 @@ async def cb_job_del_yes(c: CallbackQuery):
         await c.message.edit_text("Не нашла задачу (возможно, уже отправлена).")
     await c.answer()
 
+# ---- move job time ----
 @dp.callback_query(F.data.startswith("job:move:"))
 async def cb_job_move_start(c: CallbackQuery, state: FSMContext):
     if not await db_is_admin(c.from_user.id):
@@ -1053,7 +1240,6 @@ async def cb_post_del_yes(c: CallbackQuery, bot: Bot):
         await c.answer("Пост не найден.", show_alert=True)
         return
 
-    # delete both messages if split_text used
     try:
         await bot.delete_message(chat_id=p["channel_id"], message_id=p["message_id"])
     except Exception as e:
@@ -1117,7 +1303,6 @@ async def edit_get_buttons(m: Message, state: FSMContext):
     buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
     await state.update_data(new_buttons=buttons)
 
-    # ask photo update or keep?
     await state.set_state(EditPost.photo)
     await m.answer(
         "Теперь пришли НОВОЕ фото (если хочешь заменить).\n"
@@ -1161,7 +1346,6 @@ async def edit_get_photo(m: Message, state: FSMContext):
 
     photo_file_id = (await state.get_data()).get("photo_file_id")
 
-    # if photo exists but new_text too long -> ask choice
     if photo_file_id and caption_too_long(new_text):
         await state.set_state(EditPost.long_with_photo_choice)
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1246,16 +1430,8 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
     buttons_kb = build_kb(new_buttons)
     buttons_json = json.dumps(new_buttons, ensure_ascii=False)
 
-    # Strategy:
-    # - If no photo: edit text on message_id, ensure text_msg_id is null (and delete old text_msg_id if existed)
-    # - If photo:
-    #     - if split_text: photo has short caption, text message has buttons; ensure both exist (create/update/delete)
-    #     - else: photo has full caption+buttons; delete text message if existed
-
     try:
-        # Case 1: no photo now
         if not photo_file_id:
-            # delete extra text message if existed
             if p["text_msg_id"]:
                 try:
                     await bot.delete_message(chat_id=p["channel_id"], message_id=p["text_msg_id"])
@@ -1277,15 +1453,9 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                 """, new_text, buttons_json, post_id)
 
         else:
-            # photo exists now
             if split_text:
                 short_caption = (new_text[:CAPTION_LIMIT - 3] + "…") if len(new_text) > CAPTION_LIMIT else new_text
 
-                # update or replace photo message:
-                # If old message was photo or text, we cannot "turn text into photo" by edit.
-                # We'll keep the original message_id as the main message and:
-                # - if it was photo already AND file_id same kind, we can edit caption; media change is hard without editMessageMedia
-                # Simplify: we try edit caption on message_id; if fails, we delete and re-send both.
                 try:
                     await bot.edit_message_caption(
                         chat_id=p["channel_id"],
@@ -1294,17 +1464,14 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                         reply_markup=None
                     )
                 except Exception:
-                    # recreate
                     try:
                         await bot.delete_message(chat_id=p["channel_id"], message_id=p["message_id"])
                     except Exception:
                         pass
                     photo_msg = await bot.send_photo(p["channel_id"], photo_file_id, caption=short_caption, reply_markup=None)
-                    # update DB message_id
                     async with POOL.acquire() as conn:
                         await conn.execute("UPDATE posts SET message_id=$1 WHERE id=$2", photo_msg.message_id, post_id)
 
-                # ensure text message exists (create or edit)
                 if p["text_msg_id"]:
                     try:
                         await bot.edit_message_text(
@@ -1314,7 +1481,6 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                             reply_markup=buttons_kb,
                         )
                     except Exception:
-                        # recreate text msg
                         try:
                             await bot.delete_message(chat_id=p["channel_id"], message_id=p["text_msg_id"])
                         except Exception:
@@ -1335,15 +1501,12 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                     """, new_text, buttons_json, photo_file_id, post_id)
 
             else:
-                # one photo message with caption+buttons
-                # delete text msg if existed
                 if p["text_msg_id"]:
                     try:
                         await bot.delete_message(chat_id=p["channel_id"], message_id=p["text_msg_id"])
                     except Exception:
                         pass
 
-                # try edit caption (keeps same media)
                 try:
                     await bot.edit_message_caption(
                         chat_id=p["channel_id"],
@@ -1352,7 +1515,6 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                         reply_markup=buttons_kb
                     )
                 except Exception:
-                    # recreate as photo message
                     try:
                         await bot.delete_message(chat_id=p["channel_id"], message_id=p["message_id"])
                     except Exception:
@@ -1401,7 +1563,6 @@ async def scheduler_loop(bot: Bot):
                     text = r["text"]
                     photo_file_id = r["photo_file_id"]
 
-                    # if photo and caption too long -> split automatically
                     split_text = bool(photo_file_id and caption_too_long(text))
 
                     await publish(
@@ -1461,5 +1622,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
