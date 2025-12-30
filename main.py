@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Tuple
@@ -19,6 +20,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.exceptions import SkipHandler
 
 import asyncpg
 
@@ -337,7 +339,7 @@ class EditJob(StatesGroup):
 
 
 class MoveJob(StatesGroup):
-    manual = State()  # kept for backward safety, but manual time now handled by universal handler
+    manual = State()  # kept for backward safety, but manual time handled by universal handler flags
 
 
 class EditPost(StatesGroup):
@@ -756,7 +758,6 @@ async def cb_draft_time(c: CallbackQuery, state: FSMContext):
     code = c.data.split(":", 2)[2]
 
     if code == "manual":
-        # Universal manual datetime handler
         await state.update_data(
             awaiting_manual_datetime=True,
             manual_dt_for="draft",
@@ -1609,34 +1610,71 @@ async def run_web_server():
     await site.start()
 
 
-# ================== UNIVERSAL MANUAL DATETIME HANDLER (FIX) ==================
-@dp.message()
+# ================== UNIVERSAL MANUAL DATETIME HANDLER (FIXED) ==================
+MANUAL_DT_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}$")
+
+# состояния, в которых НЕЛЬЗЯ перехватывать обычные ответы типа "нет"
+FSM_STATES_WHERE_MANUAL_FLAG_MUST_NOT_INTERFERE_PREFIXES = (
+    "CreatePost:text",
+    "CreatePost:buttons",
+    "CreatePost:photo",
+    "EditJob:text",
+    "EditJob:buttons",
+    "EditJob:photo",
+    "EditPost:text",
+    "EditPost:buttons",
+    "EditPost:photo",
+)
+
+
+@dp.message(F.text)
 async def handle_manual_datetime(m: Message, state: FSMContext):
     """
-    Fix for 'manual datetime' not reacting.
-    We don't rely on a fragile FSM state; we use flags in FSM data.
+    Исправление:
+    - если не ждём ручную дату -> SkipHandler (не ломаем FSM)
+    - если флаг "ждём дату" остался случайно, а пользователь сейчас в шагах создания/редактирования -> сброс флага + SkipHandler
     """
     data = await state.get_data()
     if not data.get("awaiting_manual_datetime"):
-        return  # not our message
+        raise SkipHandler
+
+    current_state = await state.get_state()
+
+    # Если мы в шагах обычного ввода (кнопки/фото/текст), а флаг ожидания даты остался -> сбрасываем и пропускаем дальше
+    if current_state and any(current_state.startswith(pfx) for pfx in FSM_STATES_WHERE_MANUAL_FLAG_MUST_NOT_INTERFERE_PREFIXES):
+        await state.update_data(awaiting_manual_datetime=False, manual_dt_for=None)
+        raise SkipHandler
 
     if not await db_is_admin(m.from_user.id):
-        return await m.answer("Нет доступа.")
+        await m.answer("Нет доступа.")
+        return
 
     s = (m.text or "").strip()
-    try:
-        dt = parse_dt_local(s)
-    except Exception:
-        return await m.answer(
+
+    # Если строка вообще НЕ похожа на дату — подсказываем (в режиме ожидания даты)
+    if not MANUAL_DT_RE.match(s):
+        await m.answer(
             "Не понял формат 😅\n"
             "Нужно: `DD.MM.YYYY HH:MM`\n"
             "Пример: `30.12.2025 18:00`",
             parse_mode="Markdown"
         )
+        return
 
-    # Common guards
+    try:
+        dt = parse_dt_local(s)
+    except Exception:
+        await m.answer(
+            "Не понял формат 😅\n"
+            "Нужно: `DD.MM.YYYY HH:MM`\n"
+            "Пример: `30.12.2025 18:00`",
+            parse_mode="Markdown"
+        )
+        return
+
     if dt <= now_tz() + timedelta(seconds=30):
-        return await m.answer("Время должно быть хотя бы на 1 минуту позже текущего.")
+        await m.answer("Время должно быть хотя бы на 1 минуту позже текущего.")
+        return
 
     manual_for = data.get("manual_dt_for")
 
@@ -1649,7 +1687,8 @@ async def handle_manual_datetime(m: Message, state: FSMContext):
         job_id = data.get("move_job_id")
         if not job_id:
             await state.clear()
-            return await m.answer("Не вижу задачу для переноса. Открой Запланированные → Перенести ещё раз.")
+            await m.answer("Не вижу задачу для переноса. Открой Запланированные → Перенести ещё раз.")
+            return
         assert POOL is not None
         async with POOL.acquire() as conn:
             res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", dt, job_id)
@@ -1660,7 +1699,6 @@ async def handle_manual_datetime(m: Message, state: FSMContext):
             await m.answer("Не нашла задачу (возможно, уже отправлена).")
         return
 
-    # Unknown context
     await state.clear()
     await m.answer("Не понял, для чего была дата. Попробуй ещё раз.")
 
@@ -1685,6 +1723,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
 
