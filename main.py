@@ -3,7 +3,7 @@ import json
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -33,12 +33,12 @@ TZ = ZoneInfo(TIMEZONE)
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
-# (optional) old admins from ENV
+# Optional seed admins from env: "111,222,333"
 ENV_ADMINS = set(
     int(x.strip()) for x in (os.getenv("ADMIN_IDS", "") or "").split(",") if x.strip().isdigit()
 )
 
-# Telegram limits (Bot API)
+# Telegram limits
 CAPTION_LIMIT = 1024
 TEXT_LIMIT = 4096
 
@@ -52,13 +52,14 @@ BTN_CANCEL = "❌ Отмена"
 BTN_ADMINS = "⚙️ Админы"
 BTN_HELP = "❓ Помощь"
 
-def admin_menu_kb(is_owner: bool) -> ReplyKeyboardMarkup:
+
+def admin_menu_kb(is_owner_flag: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=BTN_NEWPOST)],
         [KeyboardButton(text=BTN_JOBS), KeyboardButton(text=BTN_POSTS)],
         [KeyboardButton(text=BTN_MYID), KeyboardButton(text=BTN_CANCEL)],
     ]
-    if is_owner:
+    if is_owner_flag:
         rows.insert(2, [KeyboardButton(text=BTN_ADMINS), KeyboardButton(text=BTN_HELP)])
     else:
         rows.insert(2, [KeyboardButton(text=BTN_HELP)])
@@ -69,8 +70,10 @@ def admin_menu_kb(is_owner: bool) -> ReplyKeyboardMarkup:
 def now_tz() -> datetime:
     return datetime.now(TZ)
 
+
 def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(TZ).strftime("%d.%m.%Y %H:%M")
+
 
 def tz_label() -> str:
     if TIMEZONE == "Europe/Moscow":
@@ -79,13 +82,14 @@ def tz_label() -> str:
         return "Рига"
     return TIMEZONE
 
-def parse_buttons(text: str):
+
+def parse_buttons(text: str) -> List[Tuple[str, str]]:
     """
     Lines:
       Text - https://example.com
     """
-    buttons = []
-    for line in text.splitlines():
+    buttons: List[Tuple[str, str]] = []
+    for line in (text or "").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -110,26 +114,33 @@ def parse_buttons(text: str):
             buttons.append((title[:64], url))
     return buttons
 
-def build_kb(buttons):
+
+def build_kb(buttons: List[Tuple[str, str]]) -> Optional[InlineKeyboardMarkup]:
     if not buttons:
         return None
-    rows = []
-    for title, url in buttons:
-        rows.append([InlineKeyboardButton(text=title, url=url)])
+    rows = [[InlineKeyboardButton(text=title, url=url)] for title, url in buttons]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def preview_actions_kb():
+
+def preview_actions_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Опубликовать сейчас", callback_data="draft:pub_now")],
         [InlineKeyboardButton(text="📅 Запланировать", callback_data="draft:schedule")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="draft:cancel")],
     ])
 
+
 def parse_dt_local(s: str) -> datetime:
     dt = datetime.strptime(s.strip(), "%d.%m.%Y %H:%M")
     return dt.replace(tzinfo=TZ)
 
+
 def quick_times_kb(prefix: str, entity_id: str) -> InlineKeyboardMarkup:
+    """
+    prefix:
+      - draft_time (for draft schedule)
+      - job_time   (for move job)
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🕛 Сегодня 12:00", callback_data=f"{prefix}:{entity_id}:today12")],
         [InlineKeyboardButton(text="🕑 Сегодня 14:00", callback_data=f"{prefix}:{entity_id}:today14")],
@@ -139,6 +150,7 @@ def quick_times_kb(prefix: str, entity_id: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🕔 Завтра 17:00", callback_data=f"{prefix}:{entity_id}:tom17")],
         [InlineKeyboardButton(text="🗓 Ввести вручную", callback_data=f"{prefix}:{entity_id}:manual")],
     ])
+
 
 def calc_quick_dt(code: str) -> datetime:
     n = now_tz()
@@ -158,6 +170,11 @@ def calc_quick_dt(code: str) -> datetime:
     }
     return mapping[code]
 
+
+def caption_too_long(text: str) -> bool:
+    return len((text or "")) > CAPTION_LIMIT
+
+
 def admin_display(row: asyncpg.Record) -> str:
     uid = row["user_id"]
     username = row["username"]
@@ -168,18 +185,14 @@ def admin_display(row: asyncpg.Record) -> str:
         return f"{name} ({uid})"
     return str(uid)
 
-def caption_too_long(text: str) -> bool:
-    return len((text or "")) > CAPTION_LIMIT
-
-def text_too_long(text: str) -> bool:
-    return len((text or "")) > TEXT_LIMIT
-
 
 # ================== DB ==================
-POOL: asyncpg.Pool | None = None
+POOL: Optional[asyncpg.Pool] = None
 
-def _need_ssl_from_url(url: str) -> bool:
-    return "sslmode=require" in url.lower()
+
+def _need_ssl(url: str) -> bool:
+    return "sslmode=require" in (url or "").lower()
+
 
 async def init_db() -> None:
     global POOL
@@ -187,7 +200,7 @@ async def init_db() -> None:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is empty. Set it in Render → Environment.")
 
-    ssl = True if "sslmode=require" in DATABASE_URL.lower() else None
+    ssl = True if _need_ssl(DATABASE_URL) else None
 
     POOL = await asyncpg.create_pool(
         DATABASE_URL,
@@ -235,6 +248,7 @@ async def init_db() -> None:
             );
         """)
 
+        # Ensure OWNER is admin
         if OWNER_ID:
             await conn.execute("""
                 INSERT INTO admins (user_id, username, name)
@@ -242,12 +256,23 @@ async def init_db() -> None:
                 ON CONFLICT (user_id) DO NOTHING;
             """, OWNER_ID)
 
+        # Seed ENV admins
+        for uid in ENV_ADMINS:
+            if uid == OWNER_ID:
+                continue
+            await conn.execute("""
+                INSERT INTO admins (user_id, username, name)
+                VALUES ($1, NULL, NULL)
+                ON CONFLICT (user_id) DO NOTHING;
+            """, uid)
+
 
 async def db_is_admin(user_id: int) -> bool:
     assert POOL is not None
     async with POOL.acquire() as conn:
         row = await conn.fetchrow("SELECT user_id FROM admins WHERE user_id=$1", user_id)
         return row is not None
+
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
@@ -262,6 +287,7 @@ def post_controls_kb(post_id: str) -> InlineKeyboardMarkup:
         ]
     ])
 
+
 def post_delete_confirm_kb(post_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -269,6 +295,7 @@ def post_delete_confirm_kb(post_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="❌ Нет", callback_data=f"post:del_no:{post_id}"),
         ]
     ])
+
 
 def job_controls_kb(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -281,6 +308,7 @@ def job_controls_kb(job_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"job:del:{job_id}"),
         ]
     ])
+
 
 def job_delete_confirm_kb(job_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -298,14 +326,7 @@ class CreatePost(StatesGroup):
     photo = State()
     long_with_photo_choice = State()
     preview = State()
-    schedule_manual = State()
 
-class EditPost(StatesGroup):
-    text = State()
-    buttons = State()
-    photo = State()
-    long_with_photo_choice = State()
-    preview = State()
 
 class EditJob(StatesGroup):
     text = State()
@@ -314,8 +335,17 @@ class EditJob(StatesGroup):
     long_with_photo_choice = State()
     preview = State()
 
+
 class MoveJob(StatesGroup):
-    manual = State()
+    manual = State()  # kept for backward safety, but manual time now handled by universal handler
+
+
+class EditPost(StatesGroup):
+    text = State()
+    buttons = State()
+    photo = State()
+    long_with_photo_choice = State()
+    preview = State()
 
 
 # ================== BOT ==================
@@ -340,12 +370,14 @@ async def start(m: Message):
             reply_markup=ReplyKeyboardRemove()
         )
 
+
 @dp.message(Command("menu"))
 async def menu(m: Message):
     uid = m.from_user.id
     if not await db_is_admin(uid):
         return await m.answer("Меню доступно только админам.")
     await m.answer("Меню 👇", reply_markup=admin_menu_kb(is_owner(uid)))
+
 
 @dp.message(Command("myid"))
 async def myid(m: Message):
@@ -359,6 +391,7 @@ async def myid(m: Message):
         f"- CHANNEL_ID: {CHANNEL_ID!r}\n"
         f"- DB: {'ok' if bool(DATABASE_URL) else 'missing'}\n"
     )
+
 
 @dp.message(Command("cancel"))
 async def cancel_cmd(m: Message, state: FSMContext):
@@ -374,9 +407,11 @@ async def cancel_cmd(m: Message, state: FSMContext):
 async def menu_myid(m: Message):
     await myid(m)
 
+
 @dp.message(F.text == BTN_CANCEL)
 async def menu_cancel(m: Message, state: FSMContext):
     await cancel_cmd(m, state)
+
 
 @dp.message(F.text == BTN_HELP)
 async def menu_help(m: Message):
@@ -400,8 +435,8 @@ async def menu_admins(m: Message):
     assert POOL is not None
     async with POOL.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM admins ORDER BY user_id ASC")
-    lines = [admin_display(r) for r in rows]
-    await m.answer("Админы:\n" + "\n".join(lines))
+    await m.answer("Админы:\n" + "\n".join(admin_display(r) for r in rows))
+
 
 @dp.message(Command("admins"))
 async def cmd_admins(m: Message):
@@ -410,8 +445,8 @@ async def cmd_admins(m: Message):
     assert POOL is not None
     async with POOL.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM admins ORDER BY user_id ASC")
-    lines = [admin_display(r) for r in rows]
-    await m.answer("Админы:\n" + "\n".join(lines))
+    await m.answer("Админы:\n" + "\n".join(admin_display(r) for r in rows))
+
 
 @dp.message(Command("addadmin"))
 async def cmd_addadmin(m: Message, bot: Bot):
@@ -420,9 +455,9 @@ async def cmd_addadmin(m: Message, bot: Bot):
     assert POOL is not None
 
     parts = (m.text or "").split()
-
     if len(parts) == 2 and parts[1].isdigit():
         uid = int(parts[1])
+
         username = None
         name = None
         try:
@@ -446,58 +481,8 @@ async def cmd_addadmin(m: Message, bot: Bot):
         disp = f"@{username} ({uid})" if username else (f"{name} ({uid})" if name else str(uid))
         return await m.answer(f"✅ Добавила админа: {disp}")
 
-    if m.reply_to_message:
-        if m.reply_to_message.forward_from:
-            u = m.reply_to_message.forward_from
-            uid = u.id
-            username = getattr(u, "username", None)
-            name = (f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}").strip() or None
+    await m.answer("Использование: /addadmin 123456789")
 
-            async with POOL.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO admins (user_id, username, name)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET username=EXCLUDED.username,
-                        name=EXCLUDED.name;
-                """, uid, username, name)
-
-            disp = f"@{username} ({uid})" if username else (f"{name} ({uid})" if name else str(uid))
-            return await m.answer(f"✅ Добавила админа по пересланному сообщению: {disp}")
-
-        if m.reply_to_message.from_user and m.reply_to_message.from_user.id == m.from_user.id:
-            return await m.answer(
-                "Не могу определить сотрудника по пересылке — Telegram скрывает автора (privacy).\n\n"
-                "Варианты:\n"
-                "1) Пусть сотрудник напишет боту /myid и пришлёт тебе цифры → /addadmin 123\n"
-                "2) Или сотрудник может временно разрешить показывать автора при пересылке."
-            )
-
-        if m.reply_to_message.from_user:
-            u = m.reply_to_message.from_user
-            uid = u.id
-            username = getattr(u, "username", None)
-            name = (f"{getattr(u, 'first_name', '')} {getattr(u, 'last_name', '')}").strip() or None
-
-            async with POOL.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO admins (user_id, username, name)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET username=EXCLUDED.username,
-                        name=EXCLUDED.name;
-                """, uid, username, name)
-
-            disp = f"@{username} ({uid})" if username else (f"{name} ({uid})" if name else str(uid))
-            return await m.answer(f"✅ Добавила админа по сообщению: {disp}")
-
-    await m.answer(
-        "Как добавить админа:\n"
-        "1) /addadmin 123456789\n"
-        "или\n"
-        "2) Перешли сообщение сотрудника → ответь на него командой /addadmin\n\n"
-        "Если Telegram скрывает автора пересылки — попроси у сотрудника /myid."
-    )
 
 @dp.message(Command("deladmin"))
 async def cmd_deladmin(m: Message):
@@ -508,6 +493,7 @@ async def cmd_deladmin(m: Message):
     parts = (m.text or "").split()
     if len(parts) != 2 or not parts[1].isdigit():
         return await m.answer("Использование: /deladmin 123456789")
+
     uid = int(parts[1])
     if uid == OWNER_ID:
         return await m.answer("OWNER удалить нельзя 🙂")
@@ -530,9 +516,11 @@ async def menu_newpost(m: Message, state: FSMContext):
     await state.set_state(CreatePost.text)
     await m.answer("Пришли текст поста.")
 
+
 @dp.message(Command("newpost"))
 async def cmd_newpost(m: Message, state: FSMContext):
     await menu_newpost(m, state)
+
 
 @dp.message(CreatePost.text)
 async def create_get_text(m: Message, state: FSMContext):
@@ -550,21 +538,17 @@ async def create_get_text(m: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
+
 @dp.message(CreatePost.buttons)
 async def create_get_buttons(m: Message, state: FSMContext):
     if not await db_is_admin(m.from_user.id):
         return await m.answer("Нет доступа.")
-
     raw = (m.text or "").strip()
     buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
-
     await state.update_data(buttons=buttons)
     await state.set_state(CreatePost.photo)
-    await m.answer(
-        "Теперь пришли ОДНО фото для поста.\n"
-        "Если фото не нужно — напиши `нет`.",
-        parse_mode="Markdown"
-    )
+    await m.answer("Теперь пришли ОДНО фото для поста или напиши `нет`.", parse_mode="Markdown")
+
 
 @dp.message(CreatePost.photo)
 async def create_get_photo(m: Message, state: FSMContext):
@@ -575,10 +559,10 @@ async def create_get_photo(m: Message, state: FSMContext):
     text = data.get("text", "")
     buttons = data.get("buttons", [])
 
-    raw = (m.text or "").strip()
+    raw = (m.text or "").strip().lower()
     photo_file_id: Optional[str] = None
 
-    if raw.lower() == "нет":
+    if raw == "нет":
         photo_file_id = None
     elif m.photo:
         photo_file_id = m.photo[-1].file_id
@@ -597,12 +581,12 @@ async def create_get_photo(m: Message, state: FSMContext):
             [InlineKeyboardButton(text="❌ Отмена", callback_data="draft:cancel")],
         ])
         return await m.answer(
-            f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}).\n"
-            "Как поступаем?",
+            f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}). Как поступаем?",
             reply_markup=kb
         )
 
     await show_preview_create(m, state, text=text, buttons=buttons, photo_file_id=photo_file_id, split_text=False)
+
 
 @dp.callback_query(F.data.startswith("longphoto:"))
 async def cb_longphoto_choice(c: CallbackQuery, state: FSMContext):
@@ -628,7 +612,6 @@ async def cb_longphoto_choice(c: CallbackQuery, state: FSMContext):
         await state.update_data(split_text=True)
         await state.set_state(CreatePost.preview)
         short_caption = (text[:CAPTION_LIMIT - 3] + "…") if len(text) > CAPTION_LIMIT else text
-
         await c.message.answer("🧾 Предпросмотр поста (фото + текст отдельным сообщением):")
         await c.message.answer_photo(photo_file_id, caption=short_caption, reply_markup=None)
         await c.message.answer(text, reply_markup=build_kb(buttons))
@@ -638,7 +621,15 @@ async def cb_longphoto_choice(c: CallbackQuery, state: FSMContext):
 
     await c.answer()
 
-async def show_preview_create(m: Message, state: FSMContext, text: str, buttons: list, photo_file_id: Optional[str], split_text: bool):
+
+async def show_preview_create(
+    m: Message,
+    state: FSMContext,
+    text: str,
+    buttons: list,
+    photo_file_id: Optional[str],
+    split_text: bool,
+):
     await state.update_data(split_text=split_text)
     await state.set_state(CreatePost.preview)
 
@@ -655,6 +646,8 @@ async def show_preview_create(m: Message, state: FSMContext, text: str, buttons:
 
     await m.answer("Что делаем дальше?", reply_markup=preview_actions_kb())
 
+
+# ---------- draft preview actions ----------
 @dp.callback_query(F.data == "draft:cancel")
 async def cb_draft_cancel(c: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -665,7 +658,6 @@ async def cb_draft_cancel(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-# ---------- PUBLISH / STORE ----------
 async def publish(
     bot: Bot,
     channel_id: str,
@@ -677,8 +669,8 @@ async def publish(
 ) -> str:
     """
     Returns post_id. Stores record in DB.
-    If photo_file_id and split_text=True -> send photo (short caption) + send text message with buttons.
-    buttons live on the text message in split_text mode.
+    If photo and split_text=True: send photo (short caption) + send text message with buttons.
+    Buttons live on the TEXT message in split_text mode.
     """
     assert POOL is not None
 
@@ -710,7 +702,6 @@ async def publish(
     return post_id
 
 
-# ---------- CALLBACKS (publish now / schedule) ----------
 @dp.callback_query(F.data == "draft:pub_now")
 async def cb_pub_now(c: CallbackQuery, state: FSMContext, bot: Bot):
     if not await db_is_admin(c.from_user.id):
@@ -746,13 +737,15 @@ async def cb_pub_now(c: CallbackQuery, state: FSMContext, bot: Bot):
     )
     await c.answer()
 
+
 @dp.callback_query(F.data == "draft:schedule")
-async def cb_schedule_start(c: CallbackQuery, state: FSMContext):
+async def cb_schedule_start(c: CallbackQuery):
     if not await db_is_admin(c.from_user.id):
         await c.answer("Нет доступа.", show_alert=True)
         return
     await c.message.answer(f"Выбери время публикации ({tz_label()}):", reply_markup=quick_times_kb("draft_time", "draft"))
     await c.answer()
+
 
 @dp.callback_query(F.data.startswith("draft_time:draft:"))
 async def cb_draft_time(c: CallbackQuery, state: FSMContext):
@@ -761,32 +754,26 @@ async def cb_draft_time(c: CallbackQuery, state: FSMContext):
         return
 
     code = c.data.split(":", 2)[2]
+
     if code == "manual":
-        await state.set_state(CreatePost.schedule_manual)
+        # Universal manual datetime handler
+        await state.update_data(
+            awaiting_manual_datetime=True,
+            manual_dt_for="draft",
+        )
         await c.message.answer(
             "Введи дату и время в формате:\n"
             "`DD.MM.YYYY HH:MM`\n"
             f"Например: `{now_tz().strftime('%d.%m.%Y %H:%M')}`",
             parse_mode="Markdown"
         )
-        return await c.answer()
+        await c.answer()
+        return
 
     run_at = calc_quick_dt(code)
     await state.update_data(run_at_iso=run_at.isoformat())
     await finalize_schedule(c.message, state)
 
-@dp.message(CreatePost.schedule_manual)
-async def draft_manual_dt(m: Message, state: FSMContext):
-    if not await db_is_admin(m.from_user.id):
-        return await m.answer("Нет доступа.")
-    s = (m.text or "").strip()
-    try:
-        run_at = parse_dt_local(s)
-    except Exception:
-        return await m.answer("Не понял формат 😅 Пример: `15.01.2026 12:00`", parse_mode="Markdown")
-
-    await state.update_data(run_at_iso=run_at.isoformat())
-    await finalize_schedule(m, state)
 
 async def finalize_schedule(target: Message, state: FSMContext):
     assert POOL is not None
@@ -800,6 +787,9 @@ async def finalize_schedule(target: Message, state: FSMContext):
     if not CHANNEL_ID:
         await state.clear()
         return await target.answer("Не задан CHANNEL_ID (Render → Environment).")
+
+    if not run_at_iso:
+        return await target.answer("Не вижу времени публикации. Попробуй ещё раз: Запланировать → выбрать время.")
 
     run_at = datetime.fromisoformat(run_at_iso)
     if run_at <= now_tz() + timedelta(seconds=30):
@@ -823,10 +813,11 @@ async def finalize_schedule(target: Message, state: FSMContext):
     )
 
 
-# ---------- JOBS ----------
+# ---------- JOBS LIST / VIEW / EDIT / MOVE / DELETE ----------
 @dp.message(F.text == BTN_JOBS)
 async def menu_jobs(m: Message):
     await cmd_jobs(m)
+
 
 @dp.message(Command("jobs"))
 async def cmd_jobs(m: Message):
@@ -858,6 +849,7 @@ async def cmd_jobs(m: Message):
             reply_markup=job_controls_kb(job_id),
         )
 
+
 @dp.callback_query(F.data.startswith("job:view:"))
 async def cb_job_view(c: CallbackQuery):
     if not await db_is_admin(c.from_user.id):
@@ -868,6 +860,7 @@ async def cb_job_view(c: CallbackQuery):
     job_id = c.data.split(":", 2)[2]
     async with POOL.acquire() as conn:
         r = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
+
     if not r:
         await c.answer("Не нашла задачу.", show_alert=True)
         return
@@ -878,6 +871,7 @@ async def cb_job_view(c: CallbackQuery):
     text = r["text"]
 
     await c.message.answer(f"👁 Запланировано на: {fmt_dt(dt)} ({tz_label()})\n🆔 `{job_id}`", parse_mode="Markdown")
+
     if photo_file_id:
         if caption_too_long(text):
             short_caption = (text[:CAPTION_LIMIT - 3] + "…") if len(text) > CAPTION_LIMIT else text
@@ -890,7 +884,91 @@ async def cb_job_view(c: CallbackQuery):
 
     await c.answer()
 
-# ---- NEW: EDIT JOB (content) ----
+
+@dp.callback_query(F.data.startswith("job:del:"))
+async def cb_job_del_ask(c: CallbackQuery):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    job_id = c.data.split(":", 2)[2]
+    await c.message.answer("Подтвердить удаление?", reply_markup=job_delete_confirm_kb(job_id))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("job:del_no:"))
+async def cb_job_del_no(c: CallbackQuery):
+    await c.message.edit_text("Ок, не удаляю.")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("job:del_yes:"))
+async def cb_job_del_yes(c: CallbackQuery):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    assert POOL is not None
+
+    job_id = c.data.split(":", 2)[2]
+    async with POOL.acquire() as conn:
+        res = await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
+
+    if res.startswith("DELETE 1"):
+        await c.message.edit_text("✅ Удалила запланированный пост.")
+    else:
+        await c.message.edit_text("Не нашла задачу (возможно, уже отправлена).")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("job:move:"))
+async def cb_job_move_start(c: CallbackQuery, state: FSMContext):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+
+    job_id = c.data.split(":", 2)[2]
+    await state.clear()
+    await state.update_data(move_job_id=job_id)
+    await c.message.answer(f"Выбери новое время ({tz_label()}):", reply_markup=quick_times_kb("job_time", job_id))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("job_time:"))
+async def cb_job_time_pick(c: CallbackQuery, state: FSMContext):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    assert POOL is not None
+
+    _, job_id, code = c.data.split(":", 2)
+
+    if code == "manual":
+        await state.update_data(
+            awaiting_manual_datetime=True,
+            manual_dt_for="job_move",
+            move_job_id=job_id,
+        )
+        await c.message.answer(
+            "Введи дату и время в формате:\n"
+            "`DD.MM.YYYY HH:MM`\n"
+            f"Например: `{now_tz().strftime('%d.%m.%Y %H:%M')}`",
+            parse_mode="Markdown"
+        )
+        await c.answer()
+        return
+
+    new_dt = calc_quick_dt(code)
+    async with POOL.acquire() as conn:
+        res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", new_dt, job_id)
+
+    await state.clear()
+    if res.startswith("UPDATE 1"):
+        await c.message.answer(f"✅ Перенесла на {fmt_dt(new_dt)} ({tz_label()})")
+    else:
+        await c.message.answer("Не нашла задачу.")
+    await c.answer()
+
+
+# ---- edit job (content) ----
 @dp.callback_query(F.data.startswith("job:edit:"))
 async def cb_job_edit_start(c: CallbackQuery, state: FSMContext):
     if not await db_is_admin(c.from_user.id):
@@ -908,9 +986,9 @@ async def cb_job_edit_start(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(EditJob.text)
     await state.update_data(edit_job_id=job_id)
-
     await c.message.answer("✏️ Редактирование отложки: пришли НОВЫЙ текст поста.")
     await c.answer()
+
 
 @dp.message(EditJob.text)
 async def editjob_get_text(m: Message, state: FSMContext):
@@ -928,6 +1006,7 @@ async def editjob_get_text(m: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
+
 @dp.message(EditJob.buttons)
 async def editjob_get_buttons(m: Message, state: FSMContext):
     if not await db_is_admin(m.from_user.id):
@@ -935,7 +1014,6 @@ async def editjob_get_buttons(m: Message, state: FSMContext):
     raw = (m.text or "").strip()
     buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
     await state.update_data(new_buttons=buttons)
-
     await state.set_state(EditJob.photo)
     await m.answer(
         "Теперь пришли НОВОЕ фото (если хочешь заменить).\n"
@@ -943,6 +1021,7 @@ async def editjob_get_buttons(m: Message, state: FSMContext):
         "Если убрать фото — напиши `убрать`.",
         parse_mode="Markdown"
     )
+
 
 @dp.message(EditJob.photo)
 async def editjob_get_photo(m: Message, state: FSMContext):
@@ -966,18 +1045,16 @@ async def editjob_get_photo(m: Message, state: FSMContext):
 
     if m.photo:
         photo_file_id = m.photo[-1].file_id
-        await state.update_data(photo_file_id=photo_file_id)
     elif m.document and (m.document.mime_type or "").startswith("image/"):
         photo_file_id = m.document.file_id
-        await state.update_data(photo_file_id=photo_file_id)
     elif incoming == "оставить":
-        await state.update_data(photo_file_id=r["photo_file_id"])
+        photo_file_id = r["photo_file_id"]
     elif incoming == "убрать":
-        await state.update_data(photo_file_id=None)
+        photo_file_id = None
     else:
         return await m.answer("Не вижу фото 😅 Пришли фото или напиши `оставить` / `убрать`.")
 
-    photo_file_id = (await state.get_data()).get("photo_file_id")
+    await state.update_data(photo_file_id=photo_file_id)
 
     if photo_file_id and caption_too_long(new_text):
         await state.set_state(EditJob.long_with_photo_choice)
@@ -987,12 +1064,12 @@ async def editjob_get_photo(m: Message, state: FSMContext):
             [InlineKeyboardButton(text="❌ Отмена", callback_data="draft:cancel")],
         ])
         return await m.answer(
-            f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}).\n"
-            "Как поступаем?",
+            f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}). Как поступаем?",
             reply_markup=kb
         )
 
     await show_preview_editjob(m, state, new_text, new_buttons, photo_file_id, split_text=False)
+
 
 @dp.callback_query(F.data.startswith("editjoblong:"))
 async def cb_editjoblong_choice(c: CallbackQuery, state: FSMContext):
@@ -1019,7 +1096,15 @@ async def cb_editjoblong_choice(c: CallbackQuery, state: FSMContext):
 
     await c.answer()
 
-async def show_preview_editjob(target: Message, state: FSMContext, text: str, buttons: list, photo_file_id: Optional[str], split_text: bool):
+
+async def show_preview_editjob(
+    target: Message,
+    state: FSMContext,
+    text: str,
+    buttons: list,
+    photo_file_id: Optional[str],
+    split_text: bool
+):
     await state.update_data(split_text=split_text)
     await state.set_state(EditJob.preview)
 
@@ -1040,6 +1125,7 @@ async def show_preview_editjob(target: Message, state: FSMContext, text: str, bu
     ])
     await target.answer("Сохранить изменения в отложке?", reply_markup=kb)
 
+
 @dp.callback_query(F.data == "job:apply_edit")
 async def cb_job_apply_edit(c: CallbackQuery, state: FSMContext):
     if not await db_is_admin(c.from_user.id):
@@ -1053,16 +1139,20 @@ async def cb_job_apply_edit(c: CallbackQuery, state: FSMContext):
     new_buttons = data.get("new_buttons", [])
     photo_file_id = data.get("photo_file_id")
 
-    buttons_json = json.dumps(new_buttons, ensure_ascii=False)
-
-    async with POOL.acquire() as conn:
-        r = await conn.fetchrow("SELECT id FROM jobs WHERE id=$1", job_id)
-    if not r:
-        await c.answer("Не нашла задачу.", show_alert=True)
+    if not job_id:
+        await c.answer("Не вижу задачу.", show_alert=True)
         await state.clear()
         return
 
+    buttons_json = json.dumps(new_buttons, ensure_ascii=False)
+
     async with POOL.acquire() as conn:
+        exists = await conn.fetchrow("SELECT id FROM jobs WHERE id=$1", job_id)
+        if not exists:
+            await c.answer("Не нашла задачу.", show_alert=True)
+            await state.clear()
+            return
+
         await conn.execute("""
             UPDATE jobs
             SET text=$1, buttons_json=$2, photo_file_id=$3
@@ -1073,114 +1163,12 @@ async def cb_job_apply_edit(c: CallbackQuery, state: FSMContext):
     await c.message.answer("✅ Обновила отложенный пост. Время публикации осталось прежним.", reply_markup=job_controls_kb(job_id))
     await c.answer()
 
-# ---- delete job ----
-@dp.callback_query(F.data.startswith("job:del:"))
-async def cb_job_del_ask(c: CallbackQuery):
-    if not await db_is_admin(c.from_user.id):
-        await c.answer("Нет доступа.", show_alert=True)
-        return
-    job_id = c.data.split(":", 2)[2]
-    await c.message.answer("Подтвердить удаление?", reply_markup=job_delete_confirm_kb(job_id))
-    await c.answer()
 
-@dp.callback_query(F.data.startswith("job:del_no:"))
-async def cb_job_del_no(c: CallbackQuery):
-    await c.message.edit_text("Ок, не удаляю.")
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("job:del_yes:"))
-async def cb_job_del_yes(c: CallbackQuery):
-    if not await db_is_admin(c.from_user.id):
-        await c.answer("Нет доступа.", show_alert=True)
-        return
-    assert POOL is not None
-
-    job_id = c.data.split(":", 2)[2]
-    async with POOL.acquire() as conn:
-        res = await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
-
-    if res.startswith("DELETE 1"):
-        await c.message.edit_text("✅ Удалила запланированный пост.")
-    else:
-        await c.message.edit_text("Не нашла задачу (возможно, уже отправлена).")
-    await c.answer()
-
-# ---- move job time ----
-@dp.callback_query(F.data.startswith("job:move:"))
-async def cb_job_move_start(c: CallbackQuery, state: FSMContext):
-    if not await db_is_admin(c.from_user.id):
-        await c.answer("Нет доступа.", show_alert=True)
-        return
-
-    job_id = c.data.split(":", 2)[2]
-    await state.clear()
-    await state.update_data(move_job_id=job_id)
-    await c.message.answer(f"Выбери новое время ({tz_label()}):", reply_markup=quick_times_kb("job_time", job_id))
-    await c.answer()
-
-@dp.callback_query(F.data.startswith("job_time:"))
-async def cb_job_time_pick(c: CallbackQuery, state: FSMContext):
-    if not await db_is_admin(c.from_user.id):
-        await c.answer("Нет доступа.", show_alert=True)
-        return
-    assert POOL is not None
-
-    _, job_id, code = c.data.split(":", 2)
-
-    if code == "manual":
-        await state.set_state(MoveJob.manual)
-        await state.update_data(move_job_id=job_id)
-        await c.message.answer(
-            "Введи дату и время в формате:\n"
-            "`DD.MM.YYYY HH:MM`\n"
-            f"Например: `{now_tz().strftime('%d.%m.%Y %H:%M')}`",
-            parse_mode="Markdown"
-        )
-        return await c.answer()
-
-    new_dt = calc_quick_dt(code)
-    async with POOL.acquire() as conn:
-        res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", new_dt, job_id)
-
-    await state.clear()
-    if res.startswith("UPDATE 1"):
-        await c.message.answer(f"✅ Перенесла на {fmt_dt(new_dt)} ({tz_label()})")
-    else:
-        await c.message.answer("Не нашла задачу.")
-    await c.answer()
-
-@dp.message(MoveJob.manual)
-async def job_move_manual(m: Message, state: FSMContext):
-    if not await db_is_admin(m.from_user.id):
-        return await m.answer("Нет доступа.")
-    assert POOL is not None
-
-    data = await state.get_data()
-    job_id = data.get("move_job_id")
-    if not job_id:
-        await state.clear()
-        return await m.answer("Не нашла задачу.")
-
-    s = (m.text or "").strip()
-    try:
-        new_dt = parse_dt_local(s)
-    except Exception:
-        return await m.answer("Не понял формат 😅 Пример: `15.01.2026 12:00`", parse_mode="Markdown")
-
-    async with POOL.acquire() as conn:
-        res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", new_dt, job_id)
-
-    await state.clear()
-    if res.startswith("UPDATE 1"):
-        await m.answer(f"✅ Перенесла на {fmt_dt(new_dt)} ({tz_label()})")
-    else:
-        await m.answer("Не нашла задачу.")
-
-
-# ---------- POSTS (LIST / EDIT / DELETE) ----------
+# ---------- POSTS LIST / EDIT / DELETE ----------
 @dp.message(F.text == BTN_POSTS)
 async def menu_posts(m: Message):
     await cmd_posts(m)
+
 
 @dp.message(Command("posts"))
 async def cmd_posts(m: Message):
@@ -1212,6 +1200,7 @@ async def cmd_posts(m: Message):
             reply_markup=post_controls_kb(post_id)
         )
 
+
 @dp.callback_query(F.data.startswith("post:del:"))
 async def cb_post_del_ask(c: CallbackQuery):
     if not await db_is_admin(c.from_user.id):
@@ -1221,10 +1210,12 @@ async def cb_post_del_ask(c: CallbackQuery):
     await c.message.answer("Подтвердить удаление?", reply_markup=post_delete_confirm_kb(post_id))
     await c.answer()
 
+
 @dp.callback_query(F.data.startswith("post:del_no:"))
 async def cb_post_del_no(c: CallbackQuery):
     await c.message.edit_text("Ок, не удаляю.")
     await c.answer()
+
 
 @dp.callback_query(F.data.startswith("post:del_yes:"))
 async def cb_post_del_yes(c: CallbackQuery, bot: Bot):
@@ -1260,6 +1251,7 @@ async def cb_post_del_yes(c: CallbackQuery, bot: Bot):
     await c.message.edit_text("✅ Удалила пост из канала.")
     await c.answer()
 
+
 @dp.callback_query(F.data.startswith("post:edit:"))
 async def cb_post_edit_start(c: CallbackQuery, state: FSMContext):
     if not await db_is_admin(c.from_user.id):
@@ -1280,6 +1272,7 @@ async def cb_post_edit_start(c: CallbackQuery, state: FSMContext):
     await c.message.answer("✏️ Редактирование: пришли НОВЫЙ текст поста.")
     await c.answer()
 
+
 @dp.message(EditPost.text)
 async def edit_get_text(m: Message, state: FSMContext):
     if not await db_is_admin(m.from_user.id):
@@ -1296,6 +1289,7 @@ async def edit_get_text(m: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
+
 @dp.message(EditPost.buttons)
 async def edit_get_buttons(m: Message, state: FSMContext):
     if not await db_is_admin(m.from_user.id):
@@ -1303,7 +1297,6 @@ async def edit_get_buttons(m: Message, state: FSMContext):
     raw = (m.text or "").strip()
     buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
     await state.update_data(new_buttons=buttons)
-
     await state.set_state(EditPost.photo)
     await m.answer(
         "Теперь пришли НОВОЕ фото (если хочешь заменить).\n"
@@ -1311,6 +1304,7 @@ async def edit_get_buttons(m: Message, state: FSMContext):
         "Если убрать фото — напиши `убрать`.",
         parse_mode="Markdown"
     )
+
 
 @dp.message(EditPost.photo)
 async def edit_get_photo(m: Message, state: FSMContext):
@@ -1330,22 +1324,18 @@ async def edit_get_photo(m: Message, state: FSMContext):
         return await m.answer("Пост не найден.")
 
     incoming = (m.text or "").strip().lower()
-    photo_file_id: Optional[str] = None
-
     if m.photo:
         photo_file_id = m.photo[-1].file_id
-        await state.update_data(photo_file_id=photo_file_id)
     elif m.document and (m.document.mime_type or "").startswith("image/"):
         photo_file_id = m.document.file_id
-        await state.update_data(photo_file_id=photo_file_id)
     elif incoming == "оставить":
-        await state.update_data(photo_file_id=p["photo_file_id"])
+        photo_file_id = p["photo_file_id"]
     elif incoming == "убрать":
-        await state.update_data(photo_file_id=None)
+        photo_file_id = None
     else:
         return await m.answer("Не вижу фото 😅 Пришли фото или напиши `оставить` / `убрать`.")
 
-    photo_file_id = (await state.get_data()).get("photo_file_id")
+    await state.update_data(photo_file_id=photo_file_id)
 
     if photo_file_id and caption_too_long(new_text):
         await state.set_state(EditPost.long_with_photo_choice)
@@ -1355,12 +1345,12 @@ async def edit_get_photo(m: Message, state: FSMContext):
             [InlineKeyboardButton(text="❌ Отмена", callback_data="draft:cancel")],
         ])
         return await m.answer(
-            f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}).\n"
-            "Как поступаем?",
+            f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}). Как поступаем?",
             reply_markup=kb
         )
 
-    await show_preview_edit(m, state, new_text, new_buttons, photo_file_id, split_text=False)
+    await show_preview_editpost(m, state, new_text, new_buttons, photo_file_id, split_text=False)
+
 
 @dp.callback_query(F.data.startswith("editlong:"))
 async def cb_editlong_choice(c: CallbackQuery, state: FSMContext):
@@ -1375,19 +1365,27 @@ async def cb_editlong_choice(c: CallbackQuery, state: FSMContext):
 
     if c.data == "editlong:nophoto":
         await state.update_data(photo_file_id=None, split_text=False)
-        await show_preview_edit(c.message, state, new_text, new_buttons, None, split_text=False)
+        await show_preview_editpost(c.message, state, new_text, new_buttons, None, split_text=False)
         await c.answer()
         return
 
     if c.data == "editlong:split":
         await state.update_data(split_text=True)
-        await show_preview_edit(c.message, state, new_text, new_buttons, photo_file_id, split_text=True)
+        await show_preview_editpost(c.message, state, new_text, new_buttons, photo_file_id, split_text=True)
         await c.answer()
         return
 
     await c.answer()
 
-async def show_preview_edit(target: Message, state: FSMContext, text: str, buttons: list, photo_file_id: Optional[str], split_text: bool):
+
+async def show_preview_editpost(
+    target: Message,
+    state: FSMContext,
+    text: str,
+    buttons: list,
+    photo_file_id: Optional[str],
+    split_text: bool
+):
     await state.update_data(split_text=split_text)
     await state.set_state(EditPost.preview)
 
@@ -1407,6 +1405,7 @@ async def show_preview_edit(target: Message, state: FSMContext, text: str, butto
         [InlineKeyboardButton(text="❌ Отменить", callback_data="draft:cancel")],
     ])
     await target.answer("Применить изменения?", reply_markup=kb)
+
 
 @dp.callback_query(F.data == "post:apply_edit")
 async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
@@ -1433,6 +1432,7 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
 
     try:
         if not photo_file_id:
+            # If previously had extra text msg, remove it
             if p["text_msg_id"]:
                 try:
                     await bot.delete_message(chat_id=p["channel_id"], message_id=p["text_msg_id"])
@@ -1457,6 +1457,7 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
             if split_text:
                 short_caption = (new_text[:CAPTION_LIMIT - 3] + "…") if len(new_text) > CAPTION_LIMIT else new_text
 
+                # Update caption on photo message (no buttons there)
                 try:
                     await bot.edit_message_caption(
                         chat_id=p["channel_id"],
@@ -1465,6 +1466,7 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                         reply_markup=None
                     )
                 except Exception:
+                    # fallback: re-send photo
                     try:
                         await bot.delete_message(chat_id=p["channel_id"], message_id=p["message_id"])
                     except Exception:
@@ -1473,6 +1475,7 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                     async with POOL.acquire() as conn:
                         await conn.execute("UPDATE posts SET message_id=$1 WHERE id=$2", photo_msg.message_id, post_id)
 
+                # Ensure/Update text message with buttons
                 if p["text_msg_id"]:
                     try:
                         await bot.edit_message_text(
@@ -1502,6 +1505,7 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                     """, new_text, buttons_json, photo_file_id, post_id)
 
             else:
+                # single photo message with caption+buttons, remove extra text msg if existed
                 if p["text_msg_id"]:
                     try:
                         await bot.delete_message(chat_id=p["channel_id"], message_id=p["text_msg_id"])
@@ -1516,6 +1520,7 @@ async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
                         reply_markup=buttons_kb
                     )
                 except Exception:
+                    # fallback: re-send
                     try:
                         await bot.delete_message(chat_id=p["channel_id"], message_id=p["message_id"])
                     except Exception:
@@ -1563,17 +1568,16 @@ async def scheduler_loop(bot: Bot):
                     buttons = json.loads(r["buttons_json"])
                     text = r["text"]
                     photo_file_id = r["photo_file_id"]
-
                     split_text = bool(photo_file_id and caption_too_long(text))
 
                     await publish(
-                        bot,
-                        r["channel_id"],
-                        text,
-                        buttons,
-                        int(r["created_by"]),
-                        photo_file_id,
-                        split_text,
+                        bot=bot,
+                        channel_id=r["channel_id"],
+                        text=text,
+                        buttons=buttons,
+                        created_by=int(r["created_by"]),
+                        photo_file_id=photo_file_id,
+                        split_text=split_text,
                     )
 
                     async with POOL.acquire() as conn:
@@ -1588,7 +1592,7 @@ async def scheduler_loop(bot: Bot):
         await asyncio.sleep(20)
 
 
-# ================== WEB SERVER ==================
+# ================== WEB SERVER (Render port binding) ==================
 async def run_web_server():
     app = web.Application()
 
@@ -1605,6 +1609,63 @@ async def run_web_server():
     await site.start()
 
 
+# ================== UNIVERSAL MANUAL DATETIME HANDLER (FIX) ==================
+@dp.message()
+async def handle_manual_datetime(m: Message, state: FSMContext):
+    """
+    Fix for 'manual datetime' not reacting.
+    We don't rely on a fragile FSM state; we use flags in FSM data.
+    """
+    data = await state.get_data()
+    if not data.get("awaiting_manual_datetime"):
+        return  # not our message
+
+    if not await db_is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+
+    s = (m.text or "").strip()
+    try:
+        dt = parse_dt_local(s)
+    except Exception:
+        return await m.answer(
+            "Не понял формат 😅\n"
+            "Нужно: `DD.MM.YYYY HH:MM`\n"
+            "Пример: `30.12.2025 18:00`",
+            parse_mode="Markdown"
+        )
+
+    # Common guards
+    if dt <= now_tz() + timedelta(seconds=30):
+        return await m.answer("Время должно быть хотя бы на 1 минуту позже текущего.")
+
+    manual_for = data.get("manual_dt_for")
+
+    if manual_for == "draft":
+        await state.update_data(run_at_iso=dt.isoformat(), awaiting_manual_datetime=False, manual_dt_for=None)
+        await finalize_schedule(m, state)
+        return
+
+    if manual_for == "job_move":
+        job_id = data.get("move_job_id")
+        if not job_id:
+            await state.clear()
+            return await m.answer("Не вижу задачу для переноса. Открой Запланированные → Перенести ещё раз.")
+        assert POOL is not None
+        async with POOL.acquire() as conn:
+            res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", dt, job_id)
+        await state.clear()
+        if res.startswith("UPDATE 1"):
+            await m.answer(f"✅ Перенесла на {fmt_dt(dt)} ({tz_label()})")
+        else:
+            await m.answer("Не нашла задачу (возможно, уже отправлена).")
+        return
+
+    # Unknown context
+    await state.clear()
+    await m.answer("Не понял, для чего была дата. Попробуй ещё раз.")
+
+
+# ================== MAIN ==================
 async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is empty. Set it in Render → Environment.")
@@ -1614,6 +1675,7 @@ async def main():
     await init_db()
 
     bot = Bot(BOT_TOKEN)
+    # Important for Render restarts / redeploys
     await bot.delete_webhook(drop_pending_updates=True)
 
     await run_web_server()
@@ -1623,4 +1685,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
