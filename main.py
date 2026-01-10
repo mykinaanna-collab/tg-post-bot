@@ -1072,7 +1072,7 @@ async def editjob_get_buttons(m: Message, state: FSMContext):
     await state.update_data(new_buttons=buttons)
     await state.set_state(EditJob.photo)
     await m.answer(
-        "Теперь пришли НОВОЕ фото (если хочешь заменить).\n"
+        "Теперь пришли НВОЕ фото (если хочешь заменить).\n"
         "Если оставить старое фото — напиши `оставить`.\n"
         "Если убрать фото — напиши `убрать`.",
         parse_mode="Markdown"
@@ -1454,5 +1454,229 @@ async def show_preview_editpost(
     await target.answer("Применить изменения?", reply_markup=kb)
 
 
-@dp
+@dp.callback_query(F.data == "post:apply_edit")
+async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    assert POOL is not None
+
+    data = await state.get_data()
+    post_id = data.get("edit_post_id")
+    new_text = data.get("new_text", "")
+    new_buttons = data.get("new_buttons", [])
+    photo_file_id = data.get("photo_file_id")
+    split_text = bool(data.get("split_text", False))
+
+    if not post_id:
+        await c.answer("Не вижу пост.", show_alert=True)
+        await state.clear()
+        return
+
+    async with POOL.acquire() as conn:
+        p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
+
+    if not p:
+        await c.answer("Пост не найден.", show_alert=True)
+        await state.clear()
+        return
+
+    if photo_file_id and caption_too_long(new_text) and not split_text:
+        await c.answer("Текст слишком длинный для подписи. Выбери режим split.", show_alert=True)
+        return
+
+    if split_text and not photo_file_id:
+        split_text = False
+
+    existing_split = bool(p["text_msg_id"])
+    existing_photo = bool(p["photo_file_id"])
+    replace_messages = False
+
+    if photo_file_id != p["photo_file_id"]:
+        replace_messages = True
+    if split_text != existing_split:
+        replace_messages = True
+
+    buttons_kb = build_kb(new_buttons)
+
+    if replace_messages:
+        await safe_delete_message(bot, p["channel_id"], p["message_id"])
+        await safe_delete_message(bot, p["channel_id"], p["text_msg_id"])
+        main_mid, text_mid = await send_post_to_channel(
+            bot=bot,
+            channel_id=p["channel_id"],
+            text=new_text,
+            buttons=new_buttons,
+            photo_file_id=photo_file_id,
+            split_text=split_text,
+        )
+        async with POOL.acquire() as conn:
+            await conn.execute("""
+                UPDATE posts
+                SET message_id=$1, text_msg_id=$2, text=$3, buttons_json=$4, photo_file_id=$5
+                WHERE id=$6
+            """, main_mid, text_mid, new_text, json.dumps(new_buttons, ensure_ascii=False), photo_file_id, post_id)
+    else:
+        if photo_file_id:
+            if split_text:
+                if not p["text_msg_id"]:
+                    await c.answer("Не вижу текстовое сообщение.", show_alert=True)
+                    await state.clear()
+                    return
+                short_caption = (new_text[:CAPTION_LIMIT - 1] + "…") if len(new_text) > CAPTION_LIMIT else new_text
+                await bot.edit_message_caption(
+                    chat_id=p["channel_id"],
+                    message_id=p["message_id"],
+                    caption=short_caption,
+                    reply_markup=None,
+                )
+                await bot.edit_message_text(
+                    chat_id=p["channel_id"],
+                    message_id=p["text_msg_id"],
+                    text=new_text,
+                    reply_markup=buttons_kb,
+                )
+            else:
+                await bot.edit_message_caption(
+                    chat_id=p["channel_id"],
+                    message_id=p["message_id"],
+                    caption=new_text,
+                    reply_markup=buttons_kb,
+                )
+        else:
+            await bot.edit_message_text(
+                chat_id=p["channel_id"],
+                message_id=p["message_id"],
+                text=new_text,
+                reply_markup=buttons_kb,
+            )
+
+        async with POOL.acquire() as conn:
+            await conn.execute("""
+                UPDATE posts
+                SET text=$1, buttons_json=$2, photo_file_id=$3
+                WHERE id=$4
+            """, new_text, json.dumps(new_buttons, ensure_ascii=False), photo_file_id, post_id)
+
+    await state.clear()
+    await c.message.answer("✅ Обновила пост.", reply_markup=post_controls_kb(post_id))
+    await c.answer()
+
+
+@dp.message(AwaitingManualDatetime())
+async def manual_datetime_input(m: Message, state: FSMContext):
+    if not await db_is_admin(m.from_user.id):
+        return await m.answer("Нет доступа.")
+    assert POOL is not None
+
+    data = await state.get_data()
+    mode = data.get("manual_dt_for")
+
+    try:
+        run_at = parse_dt_local(m.text or "")
+    except ValueError:
+        return await m.answer("Не смогла разобрать дату. Формат: `DD.MM.YYYY HH:MM`", parse_mode="Markdown")
+
+    if run_at <= now_tz() + timedelta(seconds=30):
+        return await m.answer("Время должно быть хотя бы на 1 минуту позже текущего.")
+
+    if mode == "draft":
+        await state.update_data(run_at_iso=run_at.isoformat(), awaiting_manual_datetime=False)
+        await finalize_schedule(m, state)
+        return
+
+    if mode == "job_move":
+        job_id = data.get("move_job_id")
+        if not job_id:
+            await state.clear()
+            return await m.answer("Не вижу задачу.")
+        async with POOL.acquire() as conn:
+            res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", run_at, job_id)
+        await state.clear()
+        if res.startswith("UPDATE 1"):
+            return await m.answer(f"✅ Перенесла на {fmt_dt(run_at)} ({tz_label()})")
+        return await m.answer("Не нашла задачу.")
+
+    await state.clear()
+    await m.answer("Не вижу контекста для даты. Попробуй ещё раз.")
+
+
+async def scheduler_loop(bot: Bot) -> None:
+    assert POOL is not None
+    while True:
+        try:
+            async with POOL.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT *
+                    FROM jobs
+                    WHERE run_at <= NOW()
+                    ORDER BY run_at ASC
+                    LIMIT 10
+                """)
+            if not rows:
+                await asyncio.sleep(5)
+                continue
+
+            for r in rows:
+                job_id = r["id"]
+                text = r["text"]
+                buttons = json.loads(r["buttons_json"])
+                photo_file_id = r["photo_file_id"]
+                split_text = bool(photo_file_id and caption_too_long(text))
+                try:
+                    await publish_and_store(
+                        bot=bot,
+                        channel_id=r["channel_id"],
+                        text=text,
+                        buttons=buttons,
+                        created_by=r["created_by"],
+                        photo_file_id=photo_file_id,
+                        split_text=split_text,
+                    )
+                except Exception:
+                    continue
+
+                async with POOL.acquire() as conn:
+                    await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
+        except Exception:
+            await asyncio.sleep(5)
+
+
+async def start_web_app() -> web.AppRunner:
+    app = web.Application()
+
+    async def health(_: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    return runner
+
+
+async def main() -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is empty. Set it in Render → Environment.")
+
+    await init_db()
+    bot = Bot(BOT_TOKEN)
+
+    scheduler_task = asyncio.create_task(scheduler_loop(bot))
+    web_runner = await start_web_app()
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler_task.cancel()
+        await web_runner.cleanup()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
