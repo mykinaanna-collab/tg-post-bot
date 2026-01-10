@@ -1210,12 +1210,121 @@ async def cmd_posts(m: Message):
         )
 
 
-# (!!!) Дальше блоки post:del / post:edit / post:apply_edit и scheduler/web/manual handlers
-# У ТЕБЯ ОНИ УЖЕ ЕСТЬ В КОДЕ (тот большой кусок, который ты присылала).
-# Чтобы не порвать лимит сообщения тут — я продолжу следующим сообщением сразу с:
-# 1) post:del / post:edit / post:apply_edit (полностью),
-# 2) scheduler_loop,
-# 3) web server,
-# 4) manual datetime handlers (без SkipHandler),
-# 5) main().
+@dp.callback_query(F.data.startswith("post:del:"))
+async def cb_post_del_ask(c: CallbackQuery):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    post_id = c.data.split(":", 2)[2]
+    await c.message.answer("Подтвердить удаление?", reply_markup=post_delete_confirm_kb(post_id))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("post:del_no:"))
+async def cb_post_del_no(c: CallbackQuery):
+    await c.message.edit_text("Ок, не удаляю.")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("post:del_yes:"))
+async def cb_post_del_yes(c: CallbackQuery, bot: Bot):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    assert POOL is not None
+
+    post_id = c.data.split(":", 2)[2]
+    async with POOL.acquire() as conn:
+        p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
+
+    if not p:
+        await c.answer("Пост не найден.", show_alert=True)
+        return
+
+    try:
+        await bot.delete_message(p["channel_id"], p["message_id"])
+    except Exception:
+        pass
+
+    if p["text_msg_id"]:
+        try:
+            await bot.delete_message(p["channel_id"], p["text_msg_id"])
+        except Exception:
+            pass
+
+    async with POOL.acquire() as conn:
+        await conn.execute("DELETE FROM posts WHERE id=$1", post_id)
+
+    await c.message.edit_text("✅ Удалила пост.")
+    await c.answer()
+
+
+# ---------- EDIT POST ----------
+@dp.callback_query(F.data.startswith("post:edit:"))
+async def cb_post_edit_start(c: CallbackQuery, state: FSMContext):
+    if not await db_is_admin(c.from_user.id):
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+
+    post_id = c.data.split(":", 2)[2]
+    async with POOL.acquire() as conn:
+        p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
+
+    if not p:
+        await c.answer("Пост не найден.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(EditPost.text)
+    await state.update_data(edit_post_id=post_id)
+    await c.message.answer("✏️ Редактирование поста: пришли НОВЫЙ текст.")
+    await c.answer()
+
+
+@dp.message(EditPost.text)
+async def editpost_get_text(m: Message, state: FSMContext):
+    if not await db_is_admin(m.from_user.id):
+        return
+    await state.update_data(new_text=m.text.strip())
+    await state.set_state(EditPost.buttons)
+    await m.answer("Кнопки (или `нет`):")
+
+
+@dp.message(EditPost.buttons)
+async def editpost_get_buttons(m: Message, state: FSMContext):
+    if not await db_is_admin(m.from_user.id):
+        return
+    raw = (m.text or "").strip()
+    buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
+    await state.update_data(new_buttons=buttons)
+    await state.set_state(EditPost.photo)
+    await m.answer("Новое фото / `оставить` / `убрать`:")
+
+
+@dp.message(EditPost.photo)
+async def editpost_get_photo(m: Message, state: FSMContext):
+    if not await db_is_admin(m.from_user.id):
+        return
+
+    data = await state.get_data()
+    post_id = data["edit_post_id"]
+
+    async with POOL.acquire() as conn:
+        p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
+
+    incoming = (m.text or "").lower()
+    if m.photo:
+        photo_file_id = m.photo[-1].file_id
+    elif incoming == "оставить":
+        photo_file_id = p["photo_file_id"]
+    elif incoming == "убрать":
+        photo_file_id = None
+    else:
+        await m.answer("Не понял. Фото / `оставить` / `убрать`")
+        return
+
+    await state.update_data(photo_file_id=photo_file_id)
+    await state.set_state(EditPost.preview)
+    await m.answer("Подтвердить изменения?", reply_marku_
+
 
