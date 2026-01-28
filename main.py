@@ -1,1315 +1,1116 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
-diff --git a/main.py b/main.py
-index be958a3dd94ca45df54ad1878a42e369af589cfd..5f7727a1414d33ec70158996867a4668c7b62be9 100644
---- a/main.py
-+++ b/main.py
-@@ -224,78 +224,89 @@ async def init_db() -> None:
-                 text TEXT NOT NULL,
-                 buttons_json TEXT NOT NULL,
-                 photo_file_id TEXT,
-                 run_at TIMESTAMPTZ NOT NULL,
-                 created_by BIGINT NOT NULL,
-                 created_at TIMESTAMPTZ DEFAULT NOW()
-             );
-         """)
- 
-         await conn.execute("""
-             CREATE TABLE IF NOT EXISTS posts (
-                 id TEXT PRIMARY KEY,
-                 channel_id TEXT NOT NULL,
-                 message_id BIGINT NOT NULL,
-                 text_msg_id BIGINT,
-                 text TEXT NOT NULL,
-                 buttons_json TEXT NOT NULL,
-                 photo_file_id TEXT,
-                 created_by BIGINT NOT NULL,
-                 created_at TIMESTAMPTZ DEFAULT NOW()
-             );
-         """)
- 
-         # OWNER is admin
-         if OWNER_ID:
-+            await conn.execute(
-+                "UPDATE admins SET name=NULL WHERE name='OWNER' AND user_id<>$1",
-+                OWNER_ID,
-+            )
-             await conn.execute("""
-                 INSERT INTO admins (user_id, username, name)
-                 VALUES ($1, NULL, 'OWNER')
--                ON CONFLICT (user_id) DO NOTHING;
-+                ON CONFLICT (user_id) DO UPDATE
-+                SET name=EXCLUDED.name;
-             """, OWNER_ID)
- 
-         # Seed ENV admins
-         for uid in ENV_ADMINS:
-             if uid == OWNER_ID:
-                 continue
-             await conn.execute("""
-                 INSERT INTO admins (user_id, username, name)
-                 VALUES ($1, NULL, NULL)
-                 ON CONFLICT (user_id) DO NOTHING;
-             """, uid)
- 
- 
- async def db_is_admin(user_id: int) -> bool:
-     assert POOL is not None
-     async with POOL.acquire() as conn:
-         row = await conn.fetchrow("SELECT user_id FROM admins WHERE user_id=$1", user_id)
-         return row is not None
- 
- 
- def is_owner(user_id: int) -> bool:
-     return user_id == OWNER_ID
- 
- 
-+async def is_admin(user_id: int) -> bool:
-+    if is_owner(user_id):
-+        return True
-+    return await db_is_admin(user_id)
-+
-+
- def admin_display(row: asyncpg.Record) -> str:
-     uid = row["user_id"]
-     username = row["username"]
-     name = row["name"]
-     if username:
-         return f"@{username} ({uid})"
-     if name:
-         return f"{name} ({uid})"
-     return str(uid)
- 
- 
- # ================== INLINE CONTROLS ==================
- def post_controls_kb(post_id: str) -> InlineKeyboardMarkup:
-     return InlineKeyboardMarkup(inline_keyboard=[
-         [
-             InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"post:edit:{post_id}"),
-             InlineKeyboardButton(text="🗑 Удалить", callback_data=f"post:del:{post_id}"),
-         ]
-     ])
- 
- 
- def post_delete_confirm_kb(post_id: str) -> InlineKeyboardMarkup:
-     return InlineKeyboardMarkup(inline_keyboard=[
-         [
-             InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"post:del_yes:{post_id}"),
-@@ -416,110 +427,110 @@ async def publish_and_store(
-     post_id = make_post_id(created_by, main_mid)
-     buttons_json = json.dumps(buttons, ensure_ascii=False)
- 
-     async with POOL.acquire() as conn:
-         await conn.execute("""
-             INSERT INTO posts (id, channel_id, message_id, text_msg_id, text, buttons_json, photo_file_id, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         """, post_id, channel_id, main_mid, text_mid, text, buttons_json, photo_file_id, created_by)
- 
-     return post_id
- 
- 
- async def safe_delete_message(bot: Bot, chat_id: str, message_id: Optional[int]) -> None:
-     if not message_id:
-         return
-     try:
-         await bot.delete_message(chat_id=chat_id, message_id=message_id)
-     except Exception:
-         pass
- 
- 
- # ================== COMMON ==================
- @dp.message(Command("start"))
- async def start(m: Message):
-     uid = m.from_user.id
--    if await db_is_admin(uid):
-+    if await is_admin(uid):
-         await m.answer(
-             "Привет! Меню доступно админам.\nНажми кнопки ниже 👇",
-             reply_markup=admin_menu_kb(is_owner(uid))
-         )
-     else:
-         await m.answer(
-             "Привет! Я бот для публикации постов в канал.\n"
-             "Если тебе нужен доступ — попроси владельца добавить тебя в админы.\n\n"
-             "Команда для тебя:\n"
-             "/myid — узнать свой user_id",
-             reply_markup=ReplyKeyboardRemove()
-         )
- 
- 
- @dp.message(Command("menu"))
- async def menu(m: Message):
-     uid = m.from_user.id
--    if not await db_is_admin(uid):
-+    if not await is_admin(uid):
-         return await m.answer("Меню доступно только админам.")
-     await m.answer("Меню 👇", reply_markup=admin_menu_kb(is_owner(uid)))
- 
- 
- @dp.message(Command("myid"))
- async def myid(m: Message):
-     uid = m.from_user.id
--    isadm = await db_is_admin(uid)
-+    isadm = await is_admin(uid)
-     await m.answer(
-         "Диагностика:\n"
-         f"- твой user_id: {uid}\n"
-         f"- ты админ по мнению бота: {isadm}\n"
-         f"- TIMEZONE: {TIMEZONE}\n"
-         f"- CHANNEL_ID: {CHANNEL_ID!r}\n"
-         f"- DB: {'ok' if bool(DATABASE_URL) else 'missing'}\n"
-     )
- 
- 
- @dp.message(Command("cancel"))
- async def cancel_cmd(m: Message, state: FSMContext):
-     await state.clear()
--    if await db_is_admin(m.from_user.id):
-+    if await is_admin(m.from_user.id):
-         await m.answer("Ок, отменено.", reply_markup=admin_menu_kb(is_owner(m.from_user.id)))
-     else:
-         await m.answer("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
- 
- 
- # ================== MENU BUTTONS ==================
- @dp.message(F.text == BTN_MYID)
- async def menu_myid(m: Message):
-     await myid(m)
- 
- 
- @dp.message(F.text == BTN_CANCEL)
- async def menu_cancel(m: Message, state: FSMContext):
-     await cancel_cmd(m, state)
- 
- 
- @dp.message(F.text == BTN_HELP)
- async def menu_help(m: Message):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Доступ к функциям — только админам.")
-     await m.answer(
-         "Что умею:\n"
-         "• 📝 Новый пост (текст + кнопки + фото)\n"
-         "• 📅 Запланированные (посмотреть/редактировать/перенести/удалить)\n"
-         "• 🧾 Опубликованные (редактировать/удалить)\n\n"
-         "Если меню пропало — /menu",
-         reply_markup=admin_menu_kb(is_owner(m.from_user.id))
-     )
- 
- 
- # ================== ADMIN MGMT (OWNER) ==================
- @dp.message(F.text == BTN_ADMINS)
- async def menu_admins(m: Message):
-     if not is_owner(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     assert POOL is not None
-     async with POOL.acquire() as conn:
-         rows = await conn.fetch("SELECT * FROM admins ORDER BY user_id ASC")
-     await m.answer("Админы:\n" + "\n".join(admin_display(r) for r in rows))
- 
- 
- @dp.message(Command("admins"))
- async def cmd_admins(m: Message):
-     if not is_owner(m.from_user.id):
-@@ -570,131 +581,131 @@ async def cmd_addadmin(m: Message, bot: Bot):
- async def cmd_deladmin(m: Message):
-     if not is_owner(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     assert POOL is not None
- 
-     parts = (m.text or "").split()
-     if len(parts) != 2 or not parts[1].isdigit():
-         return await m.answer("Использование: /deladmin 123456789")
- 
-     uid = int(parts[1])
-     if uid == OWNER_ID:
-         return await m.answer("OWNER удалить нельзя 🙂")
- 
-     async with POOL.acquire() as conn:
-         res = await conn.execute("DELETE FROM admins WHERE user_id=$1", uid)
- 
-     if res.startswith("DELETE 1"):
-         await m.answer(f"✅ Удалила админа: {uid}")
-     else:
-         await m.answer("Такого админа нет.")
- 
- 
- # ================== CREATE POST ==================
- @dp.message(F.text == BTN_NEWPOST)
- async def menu_newpost(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     await state.clear()
-     await state.set_state(CreatePost.text)
-     await m.answer("Пришли текст поста.")
- 
- 
- @dp.message(Command("newpost"))
- async def cmd_newpost(m: Message, state: FSMContext):
-     await menu_newpost(m, state)
- 
- 
- @dp.message(CreatePost.text)
- async def create_get_text(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     text = (m.text or "").strip()
-     if not text:
-         return await m.answer("Нужен текст поста.")
-     await state.update_data(text=text)
-     await state.set_state(CreatePost.buttons)
-     await m.answer(
-         "Теперь кнопки (по одной строке):\n"
-         "Текст - https://example.com\n\n"
-         "Если кнопки не нужны — напиши `нет`",
-         parse_mode="Markdown"
-     )
- 
- 
- @dp.message(CreatePost.buttons)
- async def create_get_buttons(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     raw = (m.text or "").strip()
-     buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
-     await state.update_data(buttons=buttons)
-     await state.set_state(CreatePost.photo)
-     await m.answer("Теперь пришли ОДНО фото для поста или напиши `нет`.", parse_mode="Markdown")
- 
- 
- @dp.message(CreatePost.photo)
- async def create_get_photo(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
- 
-     data = await state.get_data()
-     text = data.get("text", "")
-     buttons = data.get("buttons", [])
- 
-     raw = (m.text or "").strip().lower()
-     photo_file_id: Optional[str] = None
- 
-     if raw == "нет":
-         photo_file_id = None
-     elif m.photo:
-         photo_file_id = m.photo[-1].file_id
-     elif m.document and (m.document.mime_type or "").startswith("image/"):
-         photo_file_id = m.document.file_id
-     else:
-         return await m.answer("Не вижу фото 😅 Пришли фото или напиши `нет`.")
- 
-     await state.update_data(photo_file_id=photo_file_id)
- 
-     if photo_file_id and caption_too_long(text):
-         await state.set_state(CreatePost.long_with_photo_choice)
-         kb = InlineKeyboardMarkup(inline_keyboard=[
-             [InlineKeyboardButton(text="📷 Короткий caption + текст отдельно", callback_data="longphoto:split")],
-             [InlineKeyboardButton(text="📝 Без фото (весь текст одним сообщением)", callback_data="longphoto:nophoto")],
-             [InlineKeyboardButton(text="❌ Отмена", callback_data="draft:cancel")],
-         ])
-         return await m.answer(
-             f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}). Как поступаем?",
-             reply_markup=kb
-         )
- 
-     await show_preview_create(m, state, text=text, buttons=buttons, photo_file_id=photo_file_id, split_text=False)
- 
- 
- @dp.callback_query(F.data.startswith("longphoto:"))
- async def cb_longphoto_choice(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
- 
-     data = await state.get_data()
-     text = data.get("text", "")
-     buttons = data.get("buttons", [])
-     photo_file_id = data.get("photo_file_id")
- 
-     if c.data == "longphoto:nophoto":
-         await state.update_data(photo_file_id=None, split_text=False)
-         await state.set_state(CreatePost.preview)
-         await c.message.answer("🧾 Предпросмотр поста (без фото):")
-         await c.message.answer(text, reply_markup=build_kb(buttons))
-         await c.message.answer("Что делаем дальше?", reply_markup=preview_actions_kb())
-         await c.answer()
-         return
- 
-     if c.data == "longphoto:split":
-         await state.update_data(split_text=True)
-         await state.set_state(CreatePost.preview)
-         short_caption = (text[:CAPTION_LIMIT - 1] + "…") if len(text) > CAPTION_LIMIT else text
-         await c.message.answer("🧾 Предпросмотр поста (фото + текст отдельным сообщением):")
-         await c.message.answer_photo(photo_file_id, caption=short_caption, reply_markup=None)
-         await c.message.answer(text, reply_markup=build_kb(buttons))
-         await c.message.answer("Что делаем дальше?", reply_markup=preview_actions_kb())
-@@ -720,107 +731,107 @@ async def show_preview_create(
-         if split_text:
-             caption = (text[:CAPTION_LIMIT - 1] + "…") if len(text) > CAPTION_LIMIT else text
-             await m.answer_photo(photo_file_id, caption=caption, reply_markup=None)
-             await m.answer(text, reply_markup=build_kb(buttons))
-         else:
-             await m.answer_photo(photo_file_id, caption=text, reply_markup=build_kb(buttons))
-     else:
-         await m.answer(text, reply_markup=build_kb(buttons))
- 
-     await m.answer("Что делаем дальше?", reply_markup=preview_actions_kb())
- 
- 
- # ================== DRAFT ACTIONS ==================
- @dp.callback_query(F.data == "draft:cancel")
- async def cb_draft_cancel(c: CallbackQuery, state: FSMContext):
-     await state.clear()
-     try:
-         await c.message.edit_text("Ок, отменено.")
-     except Exception:
-         await c.message.answer("Ок, отменено.")
-     await c.answer()
- 
- 
- @dp.callback_query(F.data == "draft:pub_now")
- async def cb_pub_now(c: CallbackQuery, state: FSMContext, bot: Bot):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     if not CHANNEL_ID:
-         await c.answer("Не задан CHANNEL_ID (Render → Environment).", show_alert=True)
-         return
- 
-     data = await state.get_data()
-     text = data.get("text", "")
-     buttons = data.get("buttons", [])
-     photo_file_id = data.get("photo_file_id")
-     split_text = bool(data.get("split_text", False))
- 
-     try:
-         post_id = await publish_and_store(
-             bot=bot,
-             channel_id=CHANNEL_ID,
-             text=text,
-             buttons=buttons,
-             created_by=c.from_user.id,
-             photo_file_id=photo_file_id,
-             split_text=split_text,
-         )
-     except Exception as e:
-         await c.answer("Не смогла опубликовать. Проверь права бота в канале.", show_alert=True)
-         await c.message.answer(f"Ошибка: {e}")
-         return
- 
-     await state.clear()
-     try:
-         await c.message.edit_text("✅ Опубликовано!")
-     except Exception:
-         await c.message.answer("✅ Опубликовано!")
- 
-     await c.message.answer(
-         f"Управление постом (id: `{post_id}`):",
-         parse_mode="Markdown",
-         reply_markup=post_controls_kb(post_id),
-     )
-     await c.answer()
- 
- 
- @dp.callback_query(F.data == "draft:schedule")
- async def cb_schedule_start(c: CallbackQuery):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     await c.message.answer(
-         f"Выбери время публикации ({tz_label()}):",
-         reply_markup=quick_times_kb("draft_time", "draft"),
-     )
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("draft_time:draft:"))
- async def cb_draft_time(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
- 
-     code = c.data.split(":", 2)[2]
- 
-     if code == "manual":
-         await state.update_data(
-             awaiting_manual_datetime=True,
-             manual_dt_for="draft",
-         )
-         await c.message.answer(
-             "Введи дату и время в формате:\n"
-             "`DD.MM.YYYY HH:MM`\n"
-             f"Например: `{now_tz().strftime('%d.%m.%Y %H:%M')}`",
-             parse_mode="Markdown"
-         )
-         await c.answer()
-         return
- 
-     run_at = calc_quick_dt(code)
-     await state.update_data(run_at_iso=run_at.isoformat())
-     await finalize_schedule(c.message, state)
-     await c.answer()
- 
- 
-@@ -848,310 +859,310 @@ async def finalize_schedule(target: Message, state: FSMContext):
-     buttons_json = json.dumps(buttons, ensure_ascii=False)
- 
-     async with POOL.acquire() as conn:
-         await conn.execute("""
-             INSERT INTO jobs (id, channel_id, text, buttons_json, photo_file_id, run_at, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-         """, job_id, CHANNEL_ID, text, buttons_json, photo_file_id, run_at, target.from_user.id)
- 
-     await state.clear()
-     await target.answer(f"✅ Запланировано на {fmt_dt(run_at)} ({tz_label()})")
-     await target.answer(
-         f"Управление запланированным (id: `{job_id}`):",
-         parse_mode="Markdown",
-         reply_markup=job_controls_kb(job_id),
-     )
- 
- 
- # ================== JOBS ==================
- @dp.message(F.text == BTN_JOBS)
- async def menu_jobs(m: Message):
-     await cmd_jobs(m)
- 
- 
- @dp.message(Command("jobs"))
- async def cmd_jobs(m: Message):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     assert POOL is not None
- 
-     async with POOL.acquire() as conn:
-         rows = await conn.fetch("""
-             SELECT id, text, run_at
-             FROM jobs
-             ORDER BY run_at ASC
-             LIMIT 20
-         """)
- 
-     if not rows:
-         return await m.answer("Запланированных постов нет.", reply_markup=admin_menu_kb(is_owner(m.from_user.id)))
- 
-     await m.answer("📅 Запланированные (последние 20):")
-     for r in rows:
-         job_id = r["id"]
-         dt = r["run_at"]
-         short = (r["text"] or "").strip().replace("\n", " ")
-         if len(short) > 60:
-             short = short[:60] + "…"
-         await m.answer(
-             f"⏰ {fmt_dt(dt)} ({tz_label()})\n🆔 `{job_id}`\n📝 {short}",
-             parse_mode="Markdown",
-             reply_markup=job_controls_kb(job_id),
-         )
- 
- 
- @dp.callback_query(F.data.startswith("job:view:"))
- async def cb_job_view(c: CallbackQuery):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     assert POOL is not None
- 
-     job_id = c.data.split(":", 2)[2]
-     async with POOL.acquire() as conn:
-         r = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
- 
-     if not r:
-         await c.answer("Не нашла задачу.", show_alert=True)
-         return
- 
-     dt = r["run_at"]
-     buttons = json.loads(r["buttons_json"])
-     photo_file_id = r["photo_file_id"]
-     text = r["text"]
- 
-     await c.message.answer(
-         f"👁 Запланировано на: {fmt_dt(dt)} ({tz_label()})\n🆔 `{job_id}`",
-         parse_mode="Markdown"
-     )
- 
-     # отображение (если текст слишком длинный для caption — покажем split превью)
-     if photo_file_id:
-         if caption_too_long(text):
-             short_caption = (text[:CAPTION_LIMIT - 1] + "…") if len(text) > CAPTION_LIMIT else text
-             await c.message.answer_photo(photo_file_id, caption=short_caption, reply_markup=None)
-             await c.message.answer(text, reply_markup=build_kb(buttons))
-         else:
-             await c.message.answer_photo(photo_file_id, caption=text, reply_markup=build_kb(buttons))
-     else:
-         await c.message.answer(text, reply_markup=build_kb(buttons))
- 
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("job:del:"))
- async def cb_job_del_ask(c: CallbackQuery):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     job_id = c.data.split(":", 2)[2]
-     await c.message.answer("Подтвердить удаление?", reply_markup=job_delete_confirm_kb(job_id))
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("job:del_no:"))
- async def cb_job_del_no(c: CallbackQuery):
-     await c.message.edit_text("Ок, не удаляю.")
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("job:del_yes:"))
- async def cb_job_del_yes(c: CallbackQuery):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     assert POOL is not None
- 
-     job_id = c.data.split(":", 2)[2]
-     async with POOL.acquire() as conn:
-         res = await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
- 
-     if res.startswith("DELETE 1"):
-         await c.message.edit_text("✅ Удалила запланированный пост.")
-     else:
-         await c.message.edit_text("Не нашла задачу (возможно, уже отправлена).")
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("job:move:"))
- async def cb_job_move_start(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
- 
-     job_id = c.data.split(":", 2)[2]
-     await state.clear()
-     await state.update_data(move_job_id=job_id)
-     await c.message.answer(
-         f"Выбери новое время ({tz_label()}):",
-         reply_markup=quick_times_kb("job_time", job_id),
-     )
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("job_time:"))
- async def cb_job_time_pick(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     assert POOL is not None
- 
-     _, job_id, code = c.data.split(":", 2)
- 
-     if code == "manual":
-         await state.update_data(
-             awaiting_manual_datetime=True,
-             manual_dt_for="job_move",
-             move_job_id=job_id,
-         )
-         await c.message.answer(
-             "Введи дату и время в формате:\n"
-             "`DD.MM.YYYY HH:MM`\n"
-             f"Например: `{now_tz().strftime('%d.%m.%Y %H:%M')}`",
-             parse_mode="Markdown"
-         )
-         await c.answer()
-         return
- 
-     new_dt = calc_quick_dt(code)
-     async with POOL.acquire() as conn:
-         res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", new_dt, job_id)
- 
-     await state.clear()
-     if res.startswith("UPDATE 1"):
-         await c.message.answer(f"✅ Перенесла на {fmt_dt(new_dt)} ({tz_label()})")
-     else:
-         await c.message.answer("Не нашла задачу.")
-     await c.answer()
- 
- 
- # ---- edit job (content) ----
- @dp.callback_query(F.data.startswith("job:edit:"))
- async def cb_job_edit_start(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     assert POOL is not None
- 
-     job_id = c.data.split(":", 2)[2]
-     async with POOL.acquire() as conn:
-         r = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
-     if not r:
-         await c.answer("Не нашла задачу.", show_alert=True)
-         return
- 
-     await state.clear()
-     await state.set_state(EditJob.text)
-     await state.update_data(edit_job_id=job_id)
-     await c.message.answer("✏️ Редактирование отложки: пришли НОВЫЙ текст поста.")
-     await c.answer()
- 
- 
- @dp.message(EditJob.text)
- async def editjob_get_text(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     text = (m.text or "").strip()
-     if not text:
-         return await m.answer("Нужен текст.")
-     await state.update_data(new_text=text)
-     await state.set_state(EditJob.buttons)
-     await m.answer(
-         "Теперь НОВЫЕ кнопки (по одной строке):\n"
-         "Текст - https://example.com\n\n"
-         "Если кнопки не нужны — напиши `нет`",
-         parse_mode="Markdown"
-     )
- 
- 
- @dp.message(EditJob.buttons)
- async def editjob_get_buttons(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     raw = (m.text or "").strip()
-     buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
-     await state.update_data(new_buttons=buttons)
-     await state.set_state(EditJob.photo)
-     await m.answer(
-         "Теперь пришли НОВОЕ фото (если хочешь заменить).\n"
-         "Если оставить старое фото — напиши `оставить`.\n"
-         "Если убрать фото — напиши `убрать`.",
-         parse_mode="Markdown"
-     )
- 
- 
- @dp.message(EditJob.photo)
- async def editjob_get_photo(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     assert POOL is not None
- 
-     data = await state.get_data()
-     job_id = data.get("edit_job_id")
-     new_text = data.get("new_text", "")
-     new_buttons = data.get("new_buttons", [])
- 
-     async with POOL.acquire() as conn:
-         r = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
-     if not r:
-         await state.clear()
-         return await m.answer("Не нашла задачу.")
- 
-     incoming = (m.text or "").strip().lower()
-     photo_file_id: Optional[str] = None
- 
-     if m.photo:
-         photo_file_id = m.photo[-1].file_id
-     elif m.document and (m.document.mime_type or "").startswith("image/"):
-         photo_file_id = m.document.file_id
-     elif incoming == "оставить":
-         photo_file_id = r["photo_file_id"]
-     elif incoming == "убрать":
-         photo_file_id = None
-     else:
-         return await m.answer("Не вижу фото 😅 Пришли фото или напиши `оставить` / `убрать`.")
- 
-     await state.update_data(photo_file_id=photo_file_id)
- 
-     if photo_file_id and caption_too_long(new_text):
-         await state.set_state(EditJob.long_with_photo_choice)
-         kb = InlineKeyboardMarkup(inline_keyboard=[
-             [InlineKeyboardButton(text="📷 Короткий caption + текст отдельно", callback_data="editjoblong:split")],
-             [InlineKeyboardButton(text="📝 Без фото (весь текст одним сообщением)", callback_data="editjoblong:nophoto")],
-             [InlineKeyboardButton(text="❌ Отмена", callback_data="draft:cancel")],
-         ])
-         return await m.answer(
-             f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}). Как поступаем?",
-             reply_markup=kb
-         )
- 
-     await show_preview_editjob(m, state, new_text, new_buttons, photo_file_id, split_text=False)
- 
- 
- @dp.callback_query(F.data.startswith("editjoblong:"))
- async def cb_editjoblong_choice(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
- 
-     data = await state.get_data()
-     new_text = data.get("new_text", "")
-     new_buttons = data.get("new_buttons", [])
-     photo_file_id = data.get("photo_file_id")
- 
-     if c.data == "editjoblong:nophoto":
-         await state.update_data(photo_file_id=None, split_text=False)
-         await show_preview_editjob(c.message, state, new_text, new_buttons, None, split_text=False)
-         await c.answer()
-         return
- 
-     if c.data == "editjoblong:split":
-         await state.update_data(split_text=True)
-         await show_preview_editjob(c.message, state, new_text, new_buttons, photo_file_id, split_text=True)
-         await c.answer()
-         return
- 
-     await c.answer()
- 
- 
- async def show_preview_editjob(
-     target: Message,
-@@ -1162,268 +1173,268 @@ async def show_preview_editjob(
-     split_text: bool
- ):
-     await state.update_data(split_text=split_text)
-     await state.set_state(EditJob.preview)
- 
-     await target.answer("🧾 Предпросмотр обновлённой отложки:")
-     if photo_file_id:
-         if split_text:
-             short_caption = (text[:CAPTION_LIMIT - 1] + "…") if len(text) > CAPTION_LIMIT else text
-             await target.answer_photo(photo_file_id, caption=short_caption, reply_markup=None)
-             await target.answer(text, reply_markup=build_kb(buttons))
-         else:
-             await target.answer_photo(photo_file_id, caption=text, reply_markup=build_kb(buttons))
-     else:
-         await target.answer(text, reply_markup=build_kb(buttons))
- 
-     kb = InlineKeyboardMarkup(inline_keyboard=[
-         [InlineKeyboardButton(text="✅ Сохранить изменения", callback_data="job:apply_edit")],
-         [InlineKeyboardButton(text="❌ Отменить", callback_data="draft:cancel")],
-     ])
-     await target.answer("Сохранить изменения в отложке?", reply_markup=kb)
- 
- 
- @dp.callback_query(F.data == "job:apply_edit")
- async def cb_job_apply_edit(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     assert POOL is not None
- 
-     data = await state.get_data()
-     job_id = data.get("edit_job_id")
-     new_text = data.get("new_text", "")
-     new_buttons = data.get("new_buttons", [])
-     photo_file_id = data.get("photo_file_id")
- 
-     if not job_id:
-         await c.answer("Не вижу задачу.", show_alert=True)
-         await state.clear()
-         return
- 
-     buttons_json = json.dumps(new_buttons, ensure_ascii=False)
- 
-     async with POOL.acquire() as conn:
-         exists = await conn.fetchrow("SELECT id FROM jobs WHERE id=$1", job_id)
-         if not exists:
-             await c.answer("Не нашла задачу.", show_alert=True)
-             await state.clear()
-             return
- 
-         await conn.execute("""
-             UPDATE jobs
-             SET text=$1, buttons_json=$2, photo_file_id=$3
-             WHERE id=$4
-         """, new_text, buttons_json, photo_file_id, job_id)
- 
-     await state.clear()
-     await c.message.answer("✅ Обновила отложенный пост. Время публикации осталось прежним.", reply_markup=job_controls_kb(job_id))
-     await c.answer()
- 
- 
- # ================== POSTS ==================
- @dp.message(F.text == BTN_POSTS)
- async def menu_posts(m: Message):
-     await cmd_posts(m)
- 
- 
- @dp.message(Command("posts"))
- async def cmd_posts(m: Message):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     assert POOL is not None
- 
-     async with POOL.acquire() as conn:
-         rows = await conn.fetch("""
-             SELECT id, text, created_at
-             FROM posts
-             ORDER BY created_at DESC
-             LIMIT 10
-         """)
- 
-     if not rows:
-         return await m.answer("Пока нет постов, опубликованных ботом.")
- 
-     await m.answer("🧾 Последние 10 опубликованных ботом:")
-     for r in rows:
-         post_id = r["id"]
-         dt = r["created_at"]
-         short = (r["text"] or "").strip().replace("\n", " ")
-         if len(short) > 60:
-             short = short[:60] + "…"
-         await m.answer(
-             f"🕒 {fmt_dt(dt)} ({tz_label()})\n🆔 `{post_id}`\n📝 {short}",
-             parse_mode="Markdown",
-             reply_markup=post_controls_kb(post_id)
-         )
- 
- 
- @dp.callback_query(F.data.startswith("post:del:"))
- async def cb_post_del_ask(c: CallbackQuery):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     post_id = c.data.split(":", 2)[2]
-     await c.message.answer("Подтвердить удаление?", reply_markup=post_delete_confirm_kb(post_id))
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("post:del_no:"))
- async def cb_post_del_no(c: CallbackQuery):
-     await c.message.edit_text("Ок, не удаляю.")
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("post:del_yes:"))
- async def cb_post_del_yes(c: CallbackQuery, bot: Bot):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     assert POOL is not None
- 
-     post_id = c.data.split(":", 2)[2]
-     async with POOL.acquire() as conn:
-         p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
- 
-     if not p:
-         await c.answer("Пост не найден.", show_alert=True)
-         return
- 
-     await safe_delete_message(bot, p["channel_id"], p["message_id"])
-     await safe_delete_message(bot, p["channel_id"], p["text_msg_id"])
- 
-     async with POOL.acquire() as conn:
-         await conn.execute("DELETE FROM posts WHERE id=$1", post_id)
- 
-     await c.message.edit_text("✅ Удалила пост из канала.")
-     await c.answer()
- 
- 
- @dp.callback_query(F.data.startswith("post:edit:"))
- async def cb_post_edit_start(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
-     assert POOL is not None
- 
-     post_id = c.data.split(":", 2)[2]
-     async with POOL.acquire() as conn:
-         p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
-     if not p:
-         await c.answer("Пост не найден.", show_alert=True)
-         return
- 
-     await state.clear()
-     await state.set_state(EditPost.text)
-     await state.update_data(edit_post_id=post_id)
-     await c.message.answer("✏️ Редактирование: пришли НОВЫЙ текст поста.")
-     await c.answer()
- 
- 
- @dp.message(EditPost.text)
- async def edit_get_text(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     text = (m.text or "").strip()
-     if not text:
-         return await m.answer("Нужен текст.")
-     await state.update_data(new_text=text)
-     await state.set_state(EditPost.buttons)
-     await m.answer(
-         "Теперь НОВЫЕ кнопки (по одной строке):\n"
-         "Текст - https://example.com\n\n"
-         "Если кнопки не нужны — напиши `нет`",
-         parse_mode="Markdown"
-     )
- 
- 
- @dp.message(EditPost.buttons)
- async def edit_get_buttons(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     raw = (m.text or "").strip()
-     buttons = [] if raw.lower() == "нет" else parse_buttons(raw)
-     await state.update_data(new_buttons=buttons)
-     await state.set_state(EditPost.photo)
-     await m.answer(
-         "Теперь пришли НОВОЕ фото (если хочешь заменить).\n"
-         "Если оставить старое фото — напиши `оставить`.\n"
-         "Если убрать фото — напиши `убрать`.",
-         parse_mode="Markdown"
-     )
- 
- 
- @dp.message(EditPost.photo)
- async def edit_get_photo(m: Message, state: FSMContext):
--    if not await db_is_admin(m.from_user.id):
-+    if not await is_admin(m.from_user.id):
-         return await m.answer("Нет доступа.")
-     assert POOL is not None
- 
-     data = await state.get_data()
-     post_id = data.get("edit_post_id")
-     new_text = data.get("new_text", "")
-     new_buttons = data.get("new_buttons", [])
- 
-     async with POOL.acquire() as conn:
-         p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
-     if not p:
-         await state.clear()
-         return await m.answer("Пост не найден.")
- 
-     incoming = (m.text or "").strip().lower()
-     if m.photo:
-         photo_file_id = m.photo[-1].file_id
-     elif m.document and (m.document.mime_type or "").startswith("image/"):
-         photo_file_id = m.document.file_id
-     elif incoming == "оставить":
-         photo_file_id = p["photo_file_id"]
-     elif incoming == "убрать":
-         photo_file_id = None
-     else:
-         return await m.answer("Не вижу фото 😅 Пришли фото или напиши `оставить` / `убрать`.")
- 
-     await state.update_data(photo_file_id=photo_file_id)
- 
-     # если фото есть и текст длинный — спросим split/без фото
-     if photo_file_id and caption_too_long(new_text):
-         await state.set_state(EditPost.long_with_photo_choice)
-         kb = InlineKeyboardMarkup(inline_keyboard=[
-             [InlineKeyboardButton(text="📷 Короткий caption + текст отдельно", callback_data="editlong:split")],
-             [InlineKeyboardButton(text="📝 Без фото (весь текст одним сообщением)", callback_data="editlong:nophoto")],
-             [InlineKeyboardButton(text="❌ Отмена", callback_data="draft:cancel")],
-         ])
-         return await m.answer(
-             f"Текст слишком длинный для подписи к фото (лимит ~{CAPTION_LIMIT}). Как поступаем?",
-             reply_markup=kb
-         )
- 
-     await show_preview_editpost(m, state, new_text, new_buttons, photo_file_id, split_text=False)
- 
- 
- @dp.callback_query(F.data.startswith("editlong:"))
- async def cb_editlong_choice(c: CallbackQuery, state: FSMContext):
--    if not await db_is_admin(c.from_user.id):
-+    if not await is_admin(c.from_user.id):
-         await c.answer("Нет доступа.", show_alert=True)
-         return
- 
-     data = await state.get_data()
-     new_text = data.get("new_text", "")
-     new_buttons = data.get("new_buttons", [])
-     photo_file_id = data.get("photo_file_id")
- 
-     if c.data == "editlong:nophoto":
-         await state.update_data(photo_file_id=None, split_text=False)
-         await show_preview_editpost(c.message, state, new_text, new_buttons, None, split_text=False)
-         await c.answer()
-         return
- 
-     if c.data == "editlong:split":
-         await state.update_data(split_text=True)
-         await show_preview_editpost(c.message, state, new_text, new_buttons, photo_file_id, split_text=True)
-         await c.answer()
-         return
- 
-     await c.answer()
- 
- 
- async def show_preview_editpost(
-     target: Message,
-@@ -1432,27 +1443,250 @@ async def show_preview_editpost(
-     buttons: list,
-     photo_file_id: Optional[str],
-     split_text: bool
- ):
-     await state.update_data(split_text=split_text)
-     await state.set_state(EditPost.preview)
- 
-     await target.answer("🧾 Предпросмотр обновлённого поста:")
-     if photo_file_id:
-         if split_text:
-             short_caption = (text[:CAPTION_LIMIT - 1] + "…") if len(text) > CAPTION_LIMIT else text
-             await target.answer_photo(photo_file_id, caption=short_caption, reply_markup=None)
-             await target.answer(text, reply_markup=build_kb(buttons))
-         else:
-             await target.answer_photo(photo_file_id, caption=text, reply_markup=build_kb(buttons))
-     else:
-         await target.answer(text, reply_markup=build_kb(buttons))
- 
-     kb = InlineKeyboardMarkup(inline_keyboard=[
-         [InlineKeyboardButton(text="✅ Применить изменения", callback_data="post:apply_edit")],
-         [InlineKeyboardButton(text="❌ Отменить", callback_data="draft:cancel")],
-     ])
-     await target.answer("Применить изменения?", reply_markup=kb)
- 
- 
--@dp
-+@dp.callback_query(F.data == "post:apply_edit")
-+async def cb_post_apply_edit(c: CallbackQuery, state: FSMContext, bot: Bot):
-+    if not await is_admin(c.from_user.id):
-+        await c.answer("Нет доступа.", show_alert=True)
-+        return
-+    assert POOL is not None
-+
-+    data = await state.get_data()
-+    post_id = data.get("edit_post_id")
-+    new_text = data.get("new_text", "")
-+    new_buttons = data.get("new_buttons", [])
-+    photo_file_id = data.get("photo_file_id")
-+    split_text = bool(data.get("split_text", False))
-+
-+    if not post_id:
-+        await c.answer("Не вижу пост.", show_alert=True)
-+        await state.clear()
-+        return
-+
-+    async with POOL.acquire() as conn:
-+        p = await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
-+
-+    if not p:
-+        await c.answer("Пост не найден.", show_alert=True)
-+        await state.clear()
-+        return
-+
-+    if photo_file_id and caption_too_long(new_text) and not split_text:
-+        await c.answer("Текст слишком длинный для подписи. Выбери режим split.", show_alert=True)
-+        return
-+
-+    if split_text and not photo_file_id:
-+        split_text = False
-+
-+    existing_split = bool(p["text_msg_id"])
-+    existing_photo = bool(p["photo_file_id"])
-+    replace_messages = False
-+
-+    if photo_file_id != p["photo_file_id"]:
-+        replace_messages = True
-+    if split_text != existing_split:
-+        replace_messages = True
-+
-+    buttons_kb = build_kb(new_buttons)
-+
-+    if replace_messages:
-+        await safe_delete_message(bot, p["channel_id"], p["message_id"])
-+        await safe_delete_message(bot, p["channel_id"], p["text_msg_id"])
-+        main_mid, text_mid = await send_post_to_channel(
-+            bot=bot,
-+            channel_id=p["channel_id"],
-+            text=new_text,
-+            buttons=new_buttons,
-+            photo_file_id=photo_file_id,
-+            split_text=split_text,
-+        )
-+        async with POOL.acquire() as conn:
-+            await conn.execute("""
-+                UPDATE posts
-+                SET message_id=$1, text_msg_id=$2, text=$3, buttons_json=$4, photo_file_id=$5
-+                WHERE id=$6
-+            """, main_mid, text_mid, new_text, json.dumps(new_buttons, ensure_ascii=False), photo_file_id, post_id)
-+    else:
-+        if photo_file_id:
-+            if split_text:
-+                if not p["text_msg_id"]:
-+                    await c.answer("Не вижу текстовое сообщение.", show_alert=True)
-+                    await state.clear()
-+                    return
-+                short_caption = (new_text[:CAPTION_LIMIT - 1] + "…") if len(new_text) > CAPTION_LIMIT else new_text
-+                await bot.edit_message_caption(
-+                    chat_id=p["channel_id"],
-+                    message_id=p["message_id"],
-+                    caption=short_caption,
-+                    reply_markup=None,
-+                )
-+                await bot.edit_message_text(
-+                    chat_id=p["channel_id"],
-+                    message_id=p["text_msg_id"],
-+                    text=new_text,
-+                    reply_markup=buttons_kb,
-+                )
-+            else:
-+                await bot.edit_message_caption(
-+                    chat_id=p["channel_id"],
-+                    message_id=p["message_id"],
-+                    caption=new_text,
-+                    reply_markup=buttons_kb,
-+                )
-+        else:
-+            await bot.edit_message_text(
-+                chat_id=p["channel_id"],
-+                message_id=p["message_id"],
-+                text=new_text,
-+                reply_markup=buttons_kb,
-+            )
-+
-+        async with POOL.acquire() as conn:
-+            await conn.execute("""
-+                UPDATE posts
-+                SET text=$1, buttons_json=$2, photo_file_id=$3
-+                WHERE id=$4
-+            """, new_text, json.dumps(new_buttons, ensure_ascii=False), photo_file_id, post_id)
-+
-+    await state.clear()
-+    await c.message.answer("✅ Обновила пост.", reply_markup=post_controls_kb(post_id))
-+    await c.answer()
-+
-+
-+@dp.message(AwaitingManualDatetime())
-+async def manual_datetime_input(m: Message, state: FSMContext):
-+    if not await is_admin(m.from_user.id):
-+        return await m.answer("Нет доступа.")
-+    assert POOL is not None
-+
-+    data = await state.get_data()
-+    mode = data.get("manual_dt_for")
-+
-+    try:
-+        run_at = parse_dt_local(m.text or "")
-+    except ValueError:
-+        return await m.answer("Не смогла разобрать дату. Формат: `DD.MM.YYYY HH:MM`", parse_mode="Markdown")
-+
-+    if run_at <= now_tz() + timedelta(seconds=30):
-+        return await m.answer("Время должно быть хотя бы на 1 минуту позже текущего.")
-+
-+    if mode == "draft":
-+        await state.update_data(run_at_iso=run_at.isoformat(), awaiting_manual_datetime=False)
-+        await finalize_schedule(m, state)
-+        return
-+
-+    if mode == "job_move":
-+        job_id = data.get("move_job_id")
-+        if not job_id:
-+            await state.clear()
-+            return await m.answer("Не вижу задачу.")
-+        async with POOL.acquire() as conn:
-+            res = await conn.execute("UPDATE jobs SET run_at=$1 WHERE id=$2", run_at, job_id)
-+        await state.clear()
-+        if res.startswith("UPDATE 1"):
-+            return await m.answer(f"✅ Перенесла на {fmt_dt(run_at)} ({tz_label()})")
-+        return await m.answer("Не нашла задачу.")
-+
-+    await state.clear()
-+    await m.answer("Не вижу контекста для даты. Попробуй ещё раз.")
-+
-+
-+async def scheduler_loop(bot: Bot) -> None:
-+    assert POOL is not None
-+    while True:
-+        try:
-+            async with POOL.acquire() as conn:
-+                rows = await conn.fetch("""
-+                    SELECT *
-+                    FROM jobs
-+                    WHERE run_at <= NOW()
-+                    ORDER BY run_at ASC
-+                    LIMIT 10
-+                """)
-+            if not rows:
-+                await asyncio.sleep(5)
-+                continue
-+
-+            for r in rows:
-+                job_id = r["id"]
-+                text = r["text"]
-+                buttons = json.loads(r["buttons_json"])
-+                photo_file_id = r["photo_file_id"]
-+                split_text = bool(photo_file_id and caption_too_long(text))
-+                try:
-+                    await publish_and_store(
-+                        bot=bot,
-+                        channel_id=r["channel_id"],
-+                        text=text,
-+                        buttons=buttons,
-+                        created_by=r["created_by"],
-+                        photo_file_id=photo_file_id,
-+                        split_text=split_text,
-+                    )
-+                except Exception:
-+                    continue
-+
-+                async with POOL.acquire() as conn:
-+                    await conn.execute("DELETE FROM jobs WHERE id=$1", job_id)
-+        except Exception:
-+            await asyncio.sleep(5)
-+
-+
-+async def start_web_app() -> web.AppRunner:
-+    app = web.Application()
-+
-+    async def health(_: web.Request) -> web.Response:
-+        return web.Response(text="ok")
-+
-+    app.router.add_get("/", health)
-+    app.router.add_get("/health", health)
-+
-+    runner = web.AppRunner(app)
-+    await runner.setup()
-+    port = int(os.getenv("PORT", "10000"))
-+    site = web.TCPSite(runner, "0.0.0.0", port)
-+    await site.start()
-+    return runner
-+
-+
-+async def main() -> None:
-+    if not BOT_TOKEN:
-+        raise RuntimeError("BOT_TOKEN is empty. Set it in Render → Environment.")
-+
-+    await init_db()
-+    bot = Bot(BOT_TOKEN)
-+
-+    scheduler_task = asyncio.create_task(scheduler_loop(bot))
-+    web_runner = await start_web_app()
-+
-+    try:
-+        await dp.start_polling(bot)
-+    finally:
-+        scheduler_task.cancel()
-+        await web_runner.cleanup()
-+        await bot.session.close()
-+
- 
-+if __name__ == "__main__":
-+    asyncio.run(main())
- 
-EOF
+import asyncio
+import os
+from dataclasses import dataclass
+from typing import Iterable, Optional
+from urllib.parse import quote
+
+import asyncpg
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
+from aiohttp import web
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+
+CHANNEL_URL = "https://t.me/ozonbluerise"
+CONSULT_FORM_URL = os.getenv("CONSULTATION_FORM_URL", "https://example.com")
+HELP_CONTACT = "yashiann"
+INVOICE_CONTACT = "ilya_bolsheglazov"
+
+DEFAULT_ROOT_TEXT = (
+    "Приветствую, {name}!\n\n"
+    "Это «Синий рассвет» — здесь мы систематизируем бизнес на маркетплейсах: "
+    "от основ до продвинутых стратегий."
+)
+
+
+dp = Dispatcher()
+POOL: Optional[asyncpg.Pool] = None
+
+
+class EditTextFlow(StatesGroup):
+    slug = State()
+    text = State()
+
+
+class AddButtonFlow(StatesGroup):
+    slug = State()
+    label = State()
+    action = State()
+    target = State()
+    position = State()
+
+
+class EditButtonFlow(StatesGroup):
+    button_id = State()
+    label = State()
+    action = State()
+    target = State()
+    position = State()
+
+
+class DeleteButtonFlow(StatesGroup):
+    button_id = State()
+
+
+@dataclass(frozen=True)
+class Node:
+    slug: str
+    text: str
+
+
+@dataclass(frozen=True)
+class Button:
+    id: int
+    label: str
+    action_type: str
+    target: str
+    position: int
+
+
+def is_owner(user_id: int) -> bool:
+    return OWNER_ID != 0 and user_id == OWNER_ID
+
+
+def tg_link(username: str, text: str) -> str:
+    return f"https://t.me/{username}?text={quote(text)}"
+
+
+async def init_db() -> None:
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+                id SERIAL PRIMARY KEY,
+                slug TEXT UNIQUE NOT NULL,
+                text TEXT NOT NULL
+            );
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS buttons (
+                id SERIAL PRIMARY KEY,
+                node_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+                label TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                target TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+
+        root_id = await ensure_node(conn, "root", DEFAULT_ROOT_TEXT.format(name="друг"))
+        await seed_default_nodes(conn, root_id)
+
+
+async def ensure_node(conn: asyncpg.Connection, slug: str, text: str) -> int:
+    node_id = await conn.fetchval(
+        "INSERT INTO nodes (slug, text) VALUES ($1, $2) "
+        "ON CONFLICT (slug) DO NOTHING RETURNING id",
+        slug,
+        text,
+    )
+    if node_id:
+        return node_id
+    existing = await conn.fetchval("SELECT id FROM nodes WHERE slug=$1", slug)
+    if not existing:
+        raise RuntimeError(f\"Failed to create or fetch node: {slug}\")
+    return existing
+
+
+async def ensure_button(
+    conn: asyncpg.Connection,
+    node_id: int,
+    label: str,
+    action_type: str,
+    target: str,
+    position: int,
+) -> None:
+    exists = await conn.fetchval(
+        \"\"\"
+        SELECT id
+        FROM buttons
+        WHERE node_id=$1 AND label=$2 AND action_type=$3 AND target=$4
+        \"\"\",
+        node_id,
+        label,
+        action_type,
+        target,
+    )
+    if exists:
+        return
+    await conn.execute(
+        \"\"\"
+        INSERT INTO buttons (node_id, label, action_type, target, position)
+        VALUES ($1, $2, $3, $4, $5)
+        \"\"\",
+        node_id,
+        label,
+        action_type,
+        target,
+        position,
+    )
+
+
+async def seed_default_nodes(conn: asyncpg.Connection, root_id: int) -> None:
+    nodes = [
+        ("courses", "Выберите раздел 👇"),
+        (
+            "pre_courses",
+            "Все курсы в нашей линейке предзаписанные и с постоянными апдейтами под изменения в Озон.\n\n"
+            "Не надо ждать потоков, курс идет по принципу «Купи и смотри». Доступ к нему и ко всем его "
+            "изменениям остается навсегда.\n\n"
+            "Вся линейка курсов задумана, как постоянно обновляемая База Знаний, с помощью которых вы "
+            "сможете обучать новых сотрудников и постоянно актуализировать свои знания. Доступ ко всем "
+            "обновлениям купленного курса БЕСПЛАТНЫЙ.",
+        ),
+        (
+            "beginner_course",
+            "«Грамотный старт на Озон» — для селлеров и менеджеров, которые делают первые шаги в Озон "
+            "и хотят начать уверенно разбираться во всех основных вещах, необходимых для ведения прибыльного бизнеса.",
+        ),
+        (
+            "advanced_courses",
+            "Продвинутый уровень: выберите курс 👇",
+        ),
+        (
+            "pro_logistics",
+            "Курс PRO логистику для тех, кто хочет снизить СВД в своем кабинете, понимать сколько товара "
+            "грузить в каждый кластер и понять, как не переплачивать за логистику.",
+        ),
+        (
+            "pro_ads",
+            "Курс PRO рекламу — для тех, кто хочет оптимизировать свои рекламные расходы, научиться выстраивать "
+            "рекламные стратегии и понимать, какими инструментами продвижения пользоваться для разных типов товаров "
+            "и в различных ситуациях.",
+        ),
+        (
+            "pro_analytics",
+            "Курс PRO Аналитику — для тех, кто хочет изучить все значимые нюансы и все инструменты, которые необходимы для анализа.",
+        ),
+        (
+            "pro_finance",
+            "Курс «PRO Финансы» — для тех, кто хочет научиться считать юнит-план и юнит-факт, ROI и маржинальность. "
+            "Разбираться в финансовых отчетах Озона, иметь представление о кредитных инструментах.",
+        ),
+        (
+            "all_about_ozon",
+            "Все 4 блока курсов PRO логистику, PRO рекламу, PRO аналитику, PRO финансы в одном со скидкой 20%.",
+        ),
+        (
+            "special_courses",
+            "Спецкурсы и инструменты: выберите курс 👇",
+        ),
+        (
+            "pro_design",
+            "Курс «PRO Дизайн» — для тех, кто хочет понять принципы продающей инфографики, уберечь себя от ошибок "
+            "в дизайне карточек товара, которые ведут к снижению CTR, научиться выстраивать взаимоотношения с дизайнерами "
+            "и «считывать» их квалификацию.",
+        ),
+        (
+            "sxr_ai",
+            "Курс по нейросетям от SXR Studio для тех, кто смотрит в будущее и хочет научиться генерировать нейро-контент "
+            "для своих карточек товара.",
+        ),
+        (
+            "new_courses",
+            "Здесь будут появляться анонсы новых курсов и специальных форматов обучения.\n\n"
+            "Мы регулярно работаем над тем, чтобы обучение было еще полезнее и эффективнее. Возможно, это будут обновленные "
+            "программы или новые проекты.\n\n"
+            "Хотите быть в курсе всех новинок первыми?\n"
+            f"👉 Подпишитесь на наш канал: {CHANNEL_URL}\n\n"
+            "А пока все наши основные курсы для старта и уверенного роста уже ждут вас в 📚 Предзаписанные курсы.",
+        ),
+        (
+            "webinars",
+            "Поздравляю! Вам открыт доступ к вебинарам по Яндекс маркету.\n\n"
+            "Что вы получите внутри:\n"
+            "1. Запись 3-х дней вебинаров по ЯМ, в которых разобраны все аспекты работы с площадкой.\n"
+            "2. Ссылка на чат единомышленников.\n\n"
+            "Кстати, подписывайтесь на мой канал «Синий рассвет» — там куча полезной информации по Озон и про бизнес на маркетплейсах в целом.",
+        ),
+        (
+            "help",
+            "Чтобы подобрать курс, который решит именно вашу задачу, напишите напрямую @yashiann. Опишите ваш опыт и цель — "
+            "и вы получите персональную рекомендацию.",
+        ),
+        (
+            "support",
+            "По любым техническим вопросам (доступ к курсам, проблемы с оплатой) напишите напрямую @ilya_bolsheglazov. "
+            "Опишите проблему как можно подробнее — это поможет решить её быстрее.",
+        ),
+        (
+            "calculator",
+            "Поздравляю! Вам открыт доступ к обновленному калькулятору.\n\n"
+            "Что вы получите внутри:\n"
+            "1. Калькулятор с FBS и новой логистикой.\n"
+            "2. Подробное видеообъяснение к калькулятору: как пользоваться, что ввести, на что смотреть.\n\n"
+            "Кстати, подписывайтесь на мой канал «Синий рассвет». Там куча полезной информации по Озон и про бизнес на маркетплейсах в целом.",
+        ),
+        (
+            "partnership",
+            "Привет! 👋\n\n"
+            "Этот раздел — для обсуждения профессионального партнёрства. Мы открыты к совместным проектам, интеграциям, "
+            "аффилированным программам и другим форматам взаимовыгодного сотрудничества.\n\n"
+            "Чтобы предложить свою идею, напишите напрямую @yashiann в Telegram. В первом сообщении кратко опишите суть "
+            "предложения — это поможет начать диалог максимально предметно.\n\n"
+            "Жду вашего сообщения! 🤝",
+        ),
+        (
+            "consult",
+            "Индивидуальный разбор вашего кейса. Мы проанализируем текущую ситуацию, определим точки роста и сформируем план "
+            "на ближайший период.\n\n"
+            "Формат и продолжительность консультации определяются под ваш запрос.\n\n"
+            "Для записи заполните, пожалуйста, форму. Это поможет подготовиться к нашей встрече.",
+        ),
+    ]
+
+    node_ids = {"root": root_id}
+    for slug, text in nodes:
+        node_id = await ensure_node(conn, slug, text)
+        node_ids[slug] = node_id
+
+    await ensure_button(conn, root_id, "Наши курсы", "node", "courses", 1)
+    await ensure_button(conn, root_id, "Калькулятор OZON/ЯМ", "node", "calculator", 2)
+    await ensure_button(conn, root_id, "Сотрудничество", "node", "partnership", 3)
+    await ensure_button(conn, root_id, "Личная консультация", "node", "consult", 4)
+    await ensure_button(conn, node_ids["courses"], "📚 Предзаписанные курсы", "node", "pre_courses", 1)
+    await ensure_button(conn, node_ids["courses"], "🆕 Новинки и потоки", "node", "new_courses", 2)
+    await ensure_button(conn, node_ids["courses"], "🔶 Бесплатные вебинары по ЯМ", "node", "webinars", 3)
+    await ensure_button(conn, node_ids["courses"], "❓ Помощь с выбором курса", "node", "help", 4)
+    await ensure_button(conn, node_ids["courses"], "🛠️ Техническая поддержка", "node", "support", 5)
+    await ensure_button(conn, node_ids["courses"], "⬅️ Назад", "node", "root", 6)
+    await ensure_button(conn, node_ids["pre_courses"], "🚀 Ozon: Начальный уровень", "node", "beginner_course", 1)
+    await ensure_button(conn, node_ids["pre_courses"], "⚡ Ozon: Продвинутый уровень", "node", "advanced_courses", 2)
+    await ensure_button(conn, node_ids["pre_courses"], "🛠️ Спецкурсы и инструменты", "node", "special_courses", 3)
+    await ensure_button(conn, node_ids["pre_courses"], "⬅️ Назад", "node", "courses", 4)
+    await ensure_button(conn, node_ids["beginner_course"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/GSO_VC", 1)
+    await ensure_button(conn, node_ids["beginner_course"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты курса «Грамотный старт на Озон»."), 2)
+    await ensure_button(conn, node_ids["beginner_course"], "⬅️ Назад", "node", "pre_courses", 3)
+    await ensure_button(conn, node_ids["advanced_courses"], "PRO логистику", "node", "pro_logistics", 1)
+    await ensure_button(conn, node_ids["advanced_courses"], "PRO рекламу", "node", "pro_ads", 2)
+    await ensure_button(conn, node_ids["advanced_courses"], "PRO Аналитику", "node", "pro_analytics", 3)
+    await ensure_button(conn, node_ids["advanced_courses"], "PRO Финансы", "node", "pro_finance", 4)
+    await ensure_button(conn, node_ids["advanced_courses"], "Всё про Озон", "node", "all_about_ozon", 5)
+    await ensure_button(conn, node_ids["advanced_courses"], "⬅️ Назад", "node", "pre_courses", 6)
+    await ensure_button(conn, node_ids["pro_logistics"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/PRO_logistics", 1)
+    await ensure_button(conn, node_ids["pro_logistics"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты курса «PRO логистику»."), 2)
+    await ensure_button(conn, node_ids["pro_logistics"], "⬅️ Назад", "node", "advanced_courses", 3)
+    await ensure_button(conn, node_ids["pro_ads"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/PRO_Reklamu", 1)
+    await ensure_button(conn, node_ids["pro_ads"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты курса «PRO рекламу»."), 2)
+    await ensure_button(conn, node_ids["pro_ads"], "⬅️ Назад", "node", "advanced_courses", 3)
+    await ensure_button(conn, node_ids["pro_analytics"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/PRO_Analytics", 1)
+    await ensure_button(conn, node_ids["pro_analytics"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты курса «PRO Аналитику»."), 2)
+    await ensure_button(conn, node_ids["pro_analytics"], "⬅️ Назад", "node", "advanced_courses", 3)
+    await ensure_button(conn, node_ids["pro_finance"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/PRO_Finance", 1)
+    await ensure_button(conn, node_ids["pro_finance"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты курса «PRO Финансы»."), 2)
+    await ensure_button(conn, node_ids["pro_finance"], "⬅️ Назад", "node", "advanced_courses", 3)
+    await ensure_button(conn, node_ids["all_about_ozon"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/all_about_ozon", 1)
+    await ensure_button(conn, node_ids["all_about_ozon"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты комплекта «Всё про Озон»."), 2)
+    await ensure_button(conn, node_ids["all_about_ozon"], "⬅️ Назад", "node", "advanced_courses", 3)
+    await ensure_button(conn, node_ids["special_courses"], "PRO Дизайн", "node", "pro_design", 1)
+    await ensure_button(conn, node_ids["special_courses"], "Нейросети от SXR Studio", "node", "sxr_ai", 2)
+    await ensure_button(conn, node_ids["special_courses"], "⬅️ Назад", "node", "pre_courses", 3)
+    await ensure_button(conn, node_ids["pro_design"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/PRO_design", 1)
+    await ensure_button(conn, node_ids["pro_design"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты курса «PRO Дизайн»."), 2)
+    await ensure_button(conn, node_ids["pro_design"], "⬅️ Назад", "node", "special_courses", 3)
+    await ensure_button(conn, node_ids["sxr_ai"], "Узнать подробности и купить курс", "url", "https://bluerise.getcourse.ru/SXR_AI", 1)
+    await ensure_button(conn, node_ids["sxr_ai"], "Выставить счет для оплаты с р/с", "url", tg_link(INVOICE_CONTACT, "Здравствуйте, мне нужен счет для оплаты курса «Нейросети от SXR Studio»."), 2)
+    await ensure_button(conn, node_ids["sxr_ai"], "⬅️ Назад", "node", "special_courses", 3)
+    await ensure_button(conn, node_ids["new_courses"], "📚 Предзаписанные курсы", "node", "pre_courses", 1)
+    await ensure_button(conn, node_ids["new_courses"], "Подписаться на канал", "url", CHANNEL_URL, 2)
+    await ensure_button(conn, node_ids["new_courses"], "⬅️ Назад", "node", "courses", 3)
+    await ensure_button(conn, node_ids["webinars"], "Вебинар тут", "url", "https://bluerise.getcourse.ru/teach/control/stream/view/id/934642226", 1)
+    await ensure_button(conn, node_ids["webinars"], "Подписаться на канал", "url", CHANNEL_URL, 2)
+    await ensure_button(conn, node_ids["webinars"], "⬅️ Назад", "node", "courses", 3)
+    await ensure_button(conn, node_ids["help"], "Написать в поддержку", "url", tg_link(HELP_CONTACT, "Добрый день. Помогите с выбором курса."), 1)
+    await ensure_button(conn, node_ids["help"], "⬅️ Назад", "node", "courses", 2)
+    await ensure_button(conn, node_ids["support"], "Написать в поддержку", "url", tg_link(INVOICE_CONTACT, "Добрый день. Возникла техническая проблема: [опишите, пожалуйста]."), 1)
+    await ensure_button(conn, node_ids["support"], "⬅️ Назад", "node", "courses", 2)
+    await ensure_button(conn, node_ids["calculator"], "Калькулятор здесь", "url", "https://docs.google.com/spreadsheets/d/1e4AVf3dDueEoPxQHeKOVFHgSpbcLvnbGnn6_I6ApRwg/edit?gid=246238448#gid=246238448", 1)
+    await ensure_button(conn, node_ids["calculator"], "Подписаться на канал", "url", CHANNEL_URL, 2)
+    await ensure_button(conn, node_ids["calculator"], "⬅️ Назад", "node", "root", 3)
+    await ensure_button(conn, node_ids["partnership"], "Написать в Telegram", "url", tg_link(HELP_CONTACT, "Здравствуйте! Хочу обсудить сотрудничество."), 1)
+    await ensure_button(conn, node_ids["partnership"], "⬅️ Назад", "node", "root", 2)
+    await ensure_button(conn, node_ids["consult"], "📅 ЗАПОЛНИТЬ ЗАЯВКУ", "url", CONSULT_FORM_URL, 1)
+    await ensure_button(conn, node_ids["consult"], "⬅️ Назад", "node", "root", 2)
+
+
+async def fetch_node(slug: str) -> Optional[Node]:
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        row = await conn.fetchrow("SELECT slug, text FROM nodes WHERE slug=$1", slug)
+    if not row:
+        return None
+    return Node(slug=row["slug"], text=row["text"])
+
+
+async def fetch_buttons(slug: str) -> list[Button]:
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT b.id, b.label, b.action_type, b.target, b.position
+            FROM buttons b
+            JOIN nodes n ON n.id = b.node_id
+            WHERE n.slug = $1
+            ORDER BY b.position ASC, b.id ASC
+            """,
+            slug,
+        )
+    return [
+        Button(
+            id=row["id"],
+            label=row["label"],
+            action_type=row["action_type"],
+            target=row["target"],
+            position=row["position"],
+        )
+        for row in rows
+    ]
+
+
+async def find_root_target_by_label(label: str) -> Optional[str]:
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT b.target
+            FROM buttons b
+            JOIN nodes n ON n.id = b.node_id
+            WHERE n.slug='root' AND b.label=$1
+            """,
+            label,
+        )
+    if not row:
+        return None
+    return row["target"]
+
+
+def build_kb(buttons: Iterable[Button]) -> Optional[InlineKeyboardMarkup]:
+    rows: list[list[InlineKeyboardButton]] = []
+    for btn in buttons:
+        if btn.action_type == "url":
+            rows.append([InlineKeyboardButton(text=btn.label, url=btn.target)])
+        else:
+            rows.append(
+                [InlineKeyboardButton(text=btn.label, callback_data=f"node:{btn.target}")]
+            )
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_root_reply_kb(buttons: Iterable[Button]) -> ReplyKeyboardMarkup:
+    keyboard: list[list[KeyboardButton]] = []
+    for btn in buttons:
+        keyboard.append([KeyboardButton(text=btn.label)])
+    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Разделы", callback_data="admin:sections")],
+            [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="admin:edit_text")],
+            [InlineKeyboardButton(text="➕ Добавить кнопку", callback_data="admin:add_button")],
+            [InlineKeyboardButton(text="🔧 Изменить кнопку", callback_data="admin:edit_button")],
+            [InlineKeyboardButton(text="🗑 Удалить кнопку", callback_data="admin:delete_button")],
+        ]
+    )
+
+
+def admin_reply_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="📄 Разделы"),
+                KeyboardButton(text="✏️ Изменить текст"),
+            ],
+            [
+                KeyboardButton(text="➕ Добавить кнопку"),
+                KeyboardButton(text="🔧 Изменить кнопку"),
+            ],
+            [
+                KeyboardButton(text="🗑 Удалить кнопку"),
+                KeyboardButton(text="❌ Сброс"),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def render_node(target: Message, slug: str) -> None:
+    node = await fetch_node(slug)
+    if not node:
+        await target.answer("Раздел не найден. Проверьте структуру или выполните /repair.")
+        return
+    buttons = await fetch_buttons(slug)
+    await target.answer(node.text, reply_markup=build_kb(buttons))
+
+    if slug == "courses":
+        await render_node(target, "pre_courses")
+
+
+@dp.message(CommandStart())
+async def start(m: Message) -> None:
+    name = m.from_user.first_name if m.from_user else "друг"
+    node = await fetch_node("root")
+    if not node:
+        await m.answer("Меню ещё не настроено.")
+        return
+    text = node.text.replace("{name}", name)
+    buttons = await fetch_buttons("root")
+    await m.answer(text, reply_markup=build_root_reply_kb(buttons))
+
+
+@dp.message(F.text)
+async def root_menu_click(m: Message, state: FSMContext) -> None:
+    text = (m.text or "").strip()
+    if text.startswith("/"):
+        return
+    if await state.get_state():
+        return
+    target = await find_root_target_by_label(text)
+    if not target:
+        return
+    await render_node(m, target)
+
+
+@dp.callback_query(F.data.startswith("node:"))
+async def cb_node(c: CallbackQuery) -> None:
+    slug = c.data.split(":", 1)[1]
+    await render_node(c.message, slug)
+    await c.answer()
+
+
+@dp.message(F.text == "/admin")
+async def admin_help(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await m.answer(
+        "Админ-режим. Выберите действие или используйте команды ниже:\n"
+        "/nodes — список разделов\n"
+        "/node <slug> — показать раздел и кнопки\n"
+        "/addnode <slug> <text> — создать раздел\n"
+        "/delnode <slug> — удалить раздел\n"
+        "/settext <slug> <text> — обновить текст раздела\n"
+        "/addbtn <slug> <label> | <node:slug|url:https://...> | [position]\n"
+        "/setbtn <id> <label> | <node:slug|url:https://...> | [position]\n"
+        "/delbtn <id> — удалить кнопку\n\n"
+        "Чтобы выйти из пошагового режима: /cancel",
+        reply_markup=admin_reply_kb(),
+    )
+
+
+@dp.message(F.text == "/repair")
+async def repair_seed(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        root_id = await ensure_node(conn, "root", DEFAULT_ROOT_TEXT.format(name="друг"))
+        await seed_default_nodes(conn, root_id)
+    await m.answer("Структура восстановлена. Попробуйте снова открыть раздел.")
+
+
+@dp.message(F.text == "/cancel")
+async def cancel_flow(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await state.clear()
+    await m.answer("Готово, сбросила шаги.", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.callback_query(F.data == "admin:sections")
+async def admin_sections(c: CallbackQuery) -> None:
+    if not is_owner(c.from_user.id):
+        return
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT slug FROM nodes ORDER BY slug")
+    if not rows:
+        await c.message.answer("Разделов нет.")
+    else:
+        await c.message.answer("Разделы:\n" + "\n".join(row["slug"] for row in rows))
+    await c.answer()
+
+
+@dp.message(F.text == "📄 Разделы")
+async def admin_sections_text_message(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT slug FROM nodes ORDER BY slug")
+    if not rows:
+        await m.answer("Разделов нет.")
+        return
+    await m.answer("Разделы:\n" + "\n".join(row["slug"] for row in rows))
+
+
+@dp.callback_query(F.data == "admin:edit_text")
+async def admin_edit_text(c: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(c.from_user.id):
+        return
+    await state.set_state(EditTextFlow.slug)
+    await c.message.answer("Напишите slug раздела для изменения текста:")
+    await c.answer()
+
+
+@dp.message(F.text == "✏️ Изменить текст")
+async def admin_edit_text_message(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await state.set_state(EditTextFlow.slug)
+    await m.answer("Напишите slug раздела для изменения текста:")
+
+
+@dp.message(EditTextFlow.slug)
+async def admin_edit_text_slug(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    slug = (m.text or "").strip()
+    node = await fetch_node(slug)
+    if not node:
+        await m.answer("Раздел не найден. Укажите другой slug.")
+        return
+    await state.update_data(slug=slug)
+    await state.set_state(EditTextFlow.text)
+    await m.answer("Напишите новый текст раздела:")
+
+
+@dp.message(EditTextFlow.text)
+async def admin_edit_text_value(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    data = await state.get_data()
+    slug = data.get("slug")
+    if not slug:
+        await state.clear()
+        await m.answer("Не вижу slug. Начните заново.")
+        return
+    text = (m.text or "").strip()
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        await conn.execute("UPDATE nodes SET text=$1 WHERE slug=$2", text, slug)
+    await state.clear()
+    await m.answer("Текст обновлён.")
+
+
+@dp.callback_query(F.data == "admin:add_button")
+async def admin_add_button(c: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(c.from_user.id):
+        return
+    await state.set_state(AddButtonFlow.slug)
+    await c.message.answer("Введите slug раздела, куда добавить кнопку:")
+    await c.answer()
+
+
+@dp.message(F.text == "➕ Добавить кнопку")
+async def admin_add_button_message(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await state.set_state(AddButtonFlow.slug)
+    await m.answer("Введите slug раздела, куда добавить кнопку:")
+
+
+@dp.message(AddButtonFlow.slug)
+async def admin_add_button_slug(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    slug = (m.text or "").strip()
+    if not await fetch_node(slug):
+        await m.answer("Раздел не найден. Попробуйте снова.")
+        return
+    await state.update_data(slug=slug)
+    await state.set_state(AddButtonFlow.label)
+    await m.answer("Введите текст кнопки:")
+
+
+@dp.message(AddButtonFlow.label)
+async def admin_add_button_label(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    label = (m.text or "").strip()
+    await state.update_data(label=label)
+    await state.set_state(AddButtonFlow.action)
+    await m.answer("Введите тип кнопки: node или url")
+
+
+@dp.message(AddButtonFlow.action)
+async def admin_add_button_action(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    action = (m.text or "").strip().lower()
+    if action not in {"node", "url"}:
+        await m.answer("Нужно указать node или url.")
+        return
+    await state.update_data(action=action)
+    await state.set_state(AddButtonFlow.target)
+    await m.answer("Введите цель (slug раздела или ссылку):")
+
+
+@dp.message(AddButtonFlow.target)
+async def admin_add_button_target(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    target = (m.text or "").strip()
+    data = await state.get_data()
+    action = data.get("action")
+    if action == "node" and not await fetch_node(target):
+        await m.answer("Целевой раздел не найден. Введите другой slug.")
+        return
+    await state.update_data(target=target)
+    await state.set_state(AddButtonFlow.position)
+    await m.answer("Введите позицию кнопки (число) или отправьте 0:")
+
+
+@dp.message(AddButtonFlow.position)
+async def admin_add_button_position(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    raw = (m.text or "").strip()
+    if not raw.isdigit():
+        await m.answer("Нужно число. Попробуйте снова.")
+        return
+    position = int(raw)
+    data = await state.get_data()
+    slug = data.get("slug")
+    label = data.get("label")
+    action = data.get("action")
+    target = data.get("target")
+    if not all([slug, label, action, target]):
+        await state.clear()
+        await m.answer("Данные потерялись. Начните заново.")
+        return
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        node_id = await conn.fetchval("SELECT id FROM nodes WHERE slug=$1", slug)
+        await conn.execute(
+            """
+            INSERT INTO buttons (node_id, label, action_type, target, position)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            node_id,
+            label,
+            action,
+            target,
+            position,
+        )
+    await state.clear()
+    await m.answer("Кнопка добавлена.")
+
+
+@dp.callback_query(F.data == "admin:edit_button")
+async def admin_edit_button(c: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(c.from_user.id):
+        return
+    await state.set_state(EditButtonFlow.button_id)
+    await c.message.answer("Введите ID кнопки (его видно в /node <slug>):")
+    await c.answer()
+
+
+@dp.message(F.text == "🔧 Изменить кнопку")
+async def admin_edit_button_message(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await state.set_state(EditButtonFlow.button_id)
+    await m.answer("Введите ID кнопки (его видно в /node <slug>):")
+
+
+@dp.message(EditButtonFlow.button_id)
+async def admin_edit_button_id(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    raw = (m.text or "").strip()
+    if not raw.isdigit():
+        await m.answer("Нужно число ID.")
+        return
+    await state.update_data(button_id=int(raw))
+    await state.set_state(EditButtonFlow.label)
+    await m.answer("Введите новый текст кнопки:")
+
+
+@dp.message(EditButtonFlow.label)
+async def admin_edit_button_label(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await state.update_data(label=(m.text or "").strip())
+    await state.set_state(EditButtonFlow.action)
+    await m.answer("Введите тип кнопки: node или url")
+
+
+@dp.message(EditButtonFlow.action)
+async def admin_edit_button_action(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    action = (m.text or "").strip().lower()
+    if action not in {"node", "url"}:
+        await m.answer("Нужно указать node или url.")
+        return
+    await state.update_data(action=action)
+    await state.set_state(EditButtonFlow.target)
+    await m.answer("Введите цель (slug раздела или ссылку):")
+
+
+@dp.message(EditButtonFlow.target)
+async def admin_edit_button_target(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    target = (m.text or "").strip()
+    data = await state.get_data()
+    action = data.get("action")
+    if action == "node" and not await fetch_node(target):
+        await m.answer("Целевой раздел не найден. Введите другой slug.")
+        return
+    await state.update_data(target=target)
+    await state.set_state(EditButtonFlow.position)
+    await m.answer("Введите позицию кнопки (число) или отправьте 0:")
+
+
+@dp.message(EditButtonFlow.position)
+async def admin_edit_button_position(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    raw = (m.text or "").strip()
+    if not raw.isdigit():
+        await m.answer("Нужно число. Попробуйте снова.")
+        return
+    position = int(raw)
+    data = await state.get_data()
+    button_id = data.get("button_id")
+    label = data.get("label")
+    action = data.get("action")
+    target = data.get("target")
+    if button_id is None or not all([label, action, target]):
+        await state.clear()
+        await m.answer("Данные потерялись. Начните заново.")
+        return
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        res = await conn.execute(
+            """
+            UPDATE buttons
+            SET label=$1, action_type=$2, target=$3, position=$4
+            WHERE id=$5
+            """,
+            label,
+            action,
+            target,
+            position,
+            button_id,
+        )
+    await state.clear()
+    if res.endswith("0"):
+        await m.answer("Кнопка не найдена.")
+        return
+    await m.answer("Кнопка обновлена.")
+
+
+@dp.callback_query(F.data == "admin:delete_button")
+async def admin_delete_button(c: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(c.from_user.id):
+        return
+    await state.set_state(DeleteButtonFlow.button_id)
+    await c.message.answer("Введите ID кнопки для удаления:")
+    await c.answer()
+
+
+@dp.message(F.text == "🗑 Удалить кнопку")
+async def admin_delete_button_message(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await state.set_state(DeleteButtonFlow.button_id)
+    await m.answer("Введите ID кнопки для удаления:")
+
+
+@dp.message(F.text == "❌ Сброс")
+async def admin_reset_text(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    await state.clear()
+    await m.answer("Готово, сбросила шаги.", reply_markup=ReplyKeyboardRemove())
+
+
+@dp.message(DeleteButtonFlow.button_id)
+async def admin_delete_button_id(m: Message, state: FSMContext) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    raw = (m.text or "").strip()
+    if not raw.isdigit():
+        await m.answer("Нужно число ID.")
+        return
+    btn_id = int(raw)
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        res = await conn.execute("DELETE FROM buttons WHERE id=$1", btn_id)
+    await state.clear()
+    if res.endswith("0"):
+        await m.answer("Кнопка не найдена.")
+        return
+    await m.answer("Кнопка удалена.")
+
+
+@dp.message(F.text == "/nodes")
+async def list_nodes(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        rows = await conn.fetch("SELECT slug FROM nodes ORDER BY slug")
+    if not rows:
+        await m.answer("Разделов нет.")
+        return
+    await m.answer("Разделы:\n" + "\n".join(row["slug"] for row in rows))
+
+
+@dp.message(F.text.startswith("/node "))
+async def show_node(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    slug = m.text.split(maxsplit=1)[1].strip()
+    node = await fetch_node(slug)
+    if not node:
+        await m.answer("Раздел не найден.")
+        return
+    buttons = await fetch_buttons(slug)
+    if buttons:
+        btn_lines = [
+            f"#{btn.id} | {btn.label} | {btn.action_type}:{btn.target} | pos={btn.position}"
+            for btn in buttons
+        ]
+        btn_text = "\n".join(btn_lines)
+    else:
+        btn_text = "(кнопок нет)"
+    await m.answer(f"{node.text}\n\nКнопки:\n{btn_text}")
+
+
+@dp.message(F.text.startswith("/addnode "))
+async def add_node(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await m.answer("Формат: /addnode <slug> <text>")
+        return
+    slug, text = parts[1].strip(), parts[2].strip()
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        try:
+            await conn.execute(
+                "INSERT INTO nodes (slug, text) VALUES ($1, $2)", slug, text
+            )
+        except asyncpg.UniqueViolationError:
+            await m.answer("Раздел с таким slug уже существует.")
+            return
+    await m.answer(f"Раздел {slug} создан.")
+
+
+@dp.message(F.text.startswith("/delnode "))
+async def del_node(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    slug = m.text.split(maxsplit=1)[1].strip()
+    if slug == "root":
+        await m.answer("Нельзя удалить root.")
+        return
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        res = await conn.execute("DELETE FROM nodes WHERE slug=$1", slug)
+    if res.endswith("0"):
+        await m.answer("Раздел не найден.")
+        return
+    await m.answer(f"Раздел {slug} удалён.")
+
+
+@dp.message(F.text.startswith("/settext "))
+async def set_text(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await m.answer("Формат: /settext <slug> <text>")
+        return
+    slug, text = parts[1].strip(), parts[2].strip()
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        res = await conn.execute(
+            "UPDATE nodes SET text=$1 WHERE slug=$2", text, slug
+        )
+    if res.endswith("0"):
+        await m.answer("Раздел не найден.")
+        return
+    await m.answer("Текст обновлён.")
+
+
+def parse_button_payload(raw: str) -> Optional[tuple[str, str, Optional[int]]]:
+    parts = [part.strip() for part in raw.split("|")]
+    if len(parts) < 3:
+        return None
+    label = parts[0]
+    target_raw = parts[1]
+    position = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    if target_raw.startswith("node:"):
+        return (label, "node", target_raw[5:], position)
+    if target_raw.startswith("url:"):
+        return (label, "url", target_raw[4:], position)
+    return None
+
+
+@dp.message(F.text.startswith("/addbtn "))
+async def add_btn(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    raw = m.text[len("/addbtn ") :].strip()
+    slug_split = raw.split(" ", 1)
+    if len(slug_split) < 2:
+        await m.answer("Формат: /addbtn <slug> <label> | <node:slug|url:https://...> | [position]")
+        return
+    slug, rest = slug_split[0].strip(), slug_split[1].strip()
+    payload = parse_button_payload(rest)
+    if not payload:
+        await m.answer("Неверный формат кнопки.")
+        return
+    label, action_type, target, position = payload
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        node_id = await conn.fetchval("SELECT id FROM nodes WHERE slug=$1", slug)
+        if not node_id:
+            await m.answer("Раздел не найден.")
+            return
+        if action_type == "node":
+            target_exists = await conn.fetchval(
+                "SELECT 1 FROM nodes WHERE slug=$1", target
+            )
+            if not target_exists:
+                await m.answer("Целевой раздел не найден.")
+                return
+        await conn.execute(
+            """
+            INSERT INTO buttons (node_id, label, action_type, target, position)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            node_id,
+            label,
+            action_type,
+            target,
+            position or 0,
+        )
+    await m.answer("Кнопка добавлена.")
+
+
+@dp.message(F.text.startswith("/setbtn "))
+async def set_btn(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    raw = m.text[len("/setbtn ") :].strip()
+    parts = raw.split(" ", 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        await m.answer("Формат: /setbtn <id> <label> | <node:slug|url:https://...> | [position]")
+        return
+    btn_id = int(parts[0])
+    payload = parse_button_payload(parts[1])
+    if not payload:
+        await m.answer("Неверный формат кнопки.")
+        return
+    label, action_type, target, position = payload
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        if action_type == "node":
+            target_exists = await conn.fetchval(
+                "SELECT 1 FROM nodes WHERE slug=$1", target
+            )
+            if not target_exists:
+                await m.answer("Целевой раздел не найден.")
+                return
+        res = await conn.execute(
+            """
+            UPDATE buttons
+            SET label=$1, action_type=$2, target=$3, position=$4
+            WHERE id=$5
+            """,
+            label,
+            action_type,
+            target,
+            position or 0,
+            btn_id,
+        )
+    if res.endswith("0"):
+        await m.answer("Кнопка не найдена.")
+        return
+    await m.answer("Кнопка обновлена.")
+
+
+@dp.message(F.text.startswith("/delbtn "))
+async def del_btn(m: Message) -> None:
+    if not is_owner(m.from_user.id):
+        return
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await m.answer("Формат: /delbtn <id>")
+        return
+    btn_id = int(parts[1])
+    assert POOL is not None
+    async with POOL.acquire() as conn:
+        res = await conn.execute("DELETE FROM buttons WHERE id=$1", btn_id)
+    if res.endswith("0"):
+        await m.answer("Кнопка не найдена.")
+        return
+    await m.answer("Кнопка удалена.")
+
+
+async def main() -> None:
+    global POOL
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is empty. Set it in environment variables.")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is empty. Set it in environment variables.")
+    if OWNER_ID == 0:
+        raise RuntimeError("OWNER_ID is empty. Set it in environment variables.")
+
+    POOL = await asyncpg.create_pool(DATABASE_URL)
+    await init_db()
+
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+    app = web.Application()
+
+    async def health(_: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

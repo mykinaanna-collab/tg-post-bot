@@ -10,7 +10,5 @@ services:
         sync: false
       - key: OWNER_ID
         sync: false
-      - key: CHANNEL_ID
-        sync: false
-      - key: ADMIN_IDS
+      - key: DATABASE_URL
         sync: false
